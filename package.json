@@ -1,0 +1,30 @@
+{
+  "name": "rea",
+  "version": "1.1.0",
+  "description": "OpenAI-compatible local GGUF model server with upload management and idle memory reclamation",
+  "main": "index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node index.js",
+    "test": "node scripts/test-models.mjs",
+    "test:0.8b": "node scripts/test-models.mjs 0.8B 2",
+    "test:2b": "node scripts/test-models.mjs 2B 2",
+    "test:4b": "node scripts/test-models.mjs 4B 2",
+    "corpus:db": "node scripts/export-db-corpus.mjs",
+    "benchmark:db": "node scripts/export-labeled-benchmarks.mjs",
+    "benchmark:validate": "node scripts/validate-labeled-benchmarks.mjs",
+    "benchmark:run": "node scripts/run-labeled-benchmarks.mjs 2B 30 20",
+    "benchmark:run:quick": "node scripts/run-labeled-benchmarks.mjs 2B 6 2 all 10",
+    "benchmark:run:0.8b": "node scripts/run-labeled-benchmarks.mjs 0.8B 30 20",
+    "benchmark:run:4b": "node scripts/run-labeled-benchmarks.mjs 4B 6 2 all 10"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "dotenv": "^18.0.10",
+    "mysql2": "^3.15.3",
+    "node-llama-cpp": "^3.22.3"
+  }
+}

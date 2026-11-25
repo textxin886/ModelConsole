@@ -1,0 +1,1261 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>REA Model Console</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus@2.11.5/dist/index.css">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --sidebar: #0e1524;
+      --panel: #141d30;
+      --line: #27334c;
+      --text: #e8edf7;
+      --muted: #93a1ba;
+      --accent: #7c9cff;
+      --green: #55d6a5;
+      --red: #ff7b86;
+      --sidebar-width: 238px;
+      --el-color-primary: #7c9cff;
+      --el-color-primary-light-3: #617fe2;
+      --el-color-primary-light-5: #354c87;
+      --el-color-primary-light-7: #27365d;
+      --el-color-primary-light-8: #202e4d;
+      --el-color-primary-light-9: #19253d;
+      --el-color-primary-dark-2: #96afff;
+      --el-bg-color: #111a2b;
+      --el-bg-color-page: #0b1020;
+      --el-bg-color-overlay: #151f33;
+      --el-text-color-primary: #e8edf7;
+      --el-text-color-regular: #c7d0e1;
+      --el-text-color-secondary: #93a1ba;
+      --el-text-color-placeholder: #687792;
+      --el-border-color: #2a3752;
+      --el-border-color-light: #222d43;
+      --el-border-color-lighter: #1c263b;
+      --el-border-color-extra-light: #182236;
+      --el-fill-color: #182238;
+      --el-fill-color-light: #141d30;
+      --el-fill-color-lighter: #111a2b;
+      --el-fill-color-blank: #111a2b;
+      --el-mask-color: rgba(3, 7, 18, .72);
+      --el-box-shadow: 0 14px 34px rgba(0, 0, 0, .24);
+      --el-box-shadow-light: 0 8px 22px rgba(0, 0, 0, .18);
+    }
+    * { box-sizing: border-box; }
+    [v-cloak], [hidden] { display: none !important; }
+    html, body, #app { min-height: 100%; margin: 0; }
+    body {
+      min-height: 100vh;
+      background: radial-gradient(circle at top right, #1b2b55 0, transparent 38%), var(--bg);
+      color: var(--text);
+      font: 14px/1.55 Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    button, input { font: inherit; }
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: rgba(124, 156, 255, .09);
+      color: #b9c8ff;
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .app-shell { min-height: 100vh; --sidebar-width: 238px; }
+    .app-shell.is-collapsed { --sidebar-width: 76px; }
+    .sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 30;
+      display: flex;
+      width: var(--sidebar-width);
+      flex-direction: column;
+      border-right: 1px solid var(--line);
+      background: rgba(14, 21, 36, .97);
+      transition: width .22s ease, transform .22s ease;
+    }
+    .brand {
+      display: flex;
+      min-height: 78px;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid rgba(39, 51, 76, .75);
+    }
+    .brand-mark {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      flex: 0 0 38px;
+      place-items: center;
+      border: 1px solid rgba(124, 156, 255, .42);
+      border-radius: 12px;
+      background: linear-gradient(145deg, #2b3e72, #192640);
+      color: #dbe4ff;
+      font-size: 18px;
+      font-weight: 800;
+      box-shadow: inset 0 1px rgba(255, 255, 255, .08);
+    }
+    .brand-copy { min-width: 0; }
+    .brand-title { overflow: hidden; font-size: 16px; font-weight: 750; letter-spacing: .02em; text-overflow: ellipsis; white-space: nowrap; }
+    .brand-subtitle { margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .is-collapsed .brand { justify-content: center; padding-inline: 12px; }
+    .is-collapsed .brand-copy { display: none; }
+    .sidebar .el-menu { flex: 1; padding: 14px 10px; border-right: 0; background: transparent; }
+    .sidebar .el-menu-item {
+      height: 46px;
+      margin: 5px 0;
+      border-radius: 10px;
+      color: #aab6cc;
+    }
+    .sidebar .el-menu-item:hover, .sidebar .el-menu-item.is-active {
+      background: rgba(124, 156, 255, .12);
+      color: #dbe4ff;
+    }
+    .nav-icon { display: inline-grid; width: 22px; height: 22px; place-items: center; }
+    .nav-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+    .sidebar-footer { padding: 14px 12px 18px; border-top: 1px solid rgba(39, 51, 76, .75); }
+    .sidebar-footer .el-button { width: 100%; margin: 0; }
+    .sidebar-note { margin-top: 12px; color: #71809b; font-size: 11px; line-height: 1.5; text-align: center; }
+    .is-collapsed .sidebar-note { display: none; }
+    .workspace { min-height: 100vh; margin-left: var(--sidebar-width); transition: margin-left .22s ease; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      min-height: 78px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 14px 28px;
+      border-bottom: 1px solid rgba(39, 51, 76, .82);
+      background: rgba(11, 16, 32, .86);
+      backdrop-filter: blur(16px);
+    }
+    .topbar-heading { display: flex; min-width: 0; align-items: center; gap: 13px; }
+    .topbar h1 { margin: 0; font-size: 21px; line-height: 1.3; }
+    .topbar p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .topbar-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+    .mobile-menu { display: none !important; }
+    .content { width: min(1440px, 100%); margin: 0 auto; padding: 24px 28px 42px; }
+    .page-alert { margin-bottom: 16px; }
+    .metrics-grid, .panel-grid { display: flex; flex-wrap: wrap; align-items: stretch; gap: 16px; }
+    .metric-card { flex: 1 1 220px; min-width: 0; }
+    .metric-card.wide { flex: 1.35 1 260px; }
+    .metric-label { color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+    .metric-value { margin-top: 9px; font-size: clamp(25px, 2.6vw, 32px); font-weight: 750; letter-spacing: -.035em; overflow-wrap: anywhere; }
+    .metric-foot { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .panel { flex: 1 1 380px; min-width: 0; }
+    .panel.full { flex: 1 1 100%; }
+    .panel .el-card__body { padding: 18px; }
+    .panel-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .panel-heading h2 { margin: 0; font-size: 15px; }
+    .panel-heading p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .status-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .description-value { max-width: 100%; overflow-wrap: anywhere; }
+    .key-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .key-row code { flex: 1 1 240px; padding: 11px 13px; border: 1px solid var(--line); background: #0d1424; user-select: all; }
+    .endpoint-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 9px; }
+    .endpoint-row code { flex: 1 1 260px; padding: 9px 11px; background: #0d1424; }
+    .footer { margin-top: 18px; color: var(--muted); font-size: 12px; text-align: center; }
+    .page-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .toolbar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .search-input { width: min(360px, 100%); }
+    .upload-status { margin: 0 0 14px; }
+    .table-shell { width: 100%; overflow-x: auto; }
+    .model-table { min-width: 980px; }
+    .link-config-table { min-width: 1050px; }
+    .usage-table { min-width: 760px; }
+    .link-url { display: block; max-width: 430px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .link-form-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .link-form-grid .full { grid-column: 1 / -1; }
+    .link-form-grid .el-form-item { margin: 0; }
+    .model-id { display: block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .row-actions .el-button + .el-button { margin-left: 0; }
+    .dialog-tip { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .resource-grid { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
+    .resource-card { flex: 1 1 280px; min-width: 0; }
+    .resource-card .el-card__body { padding: 18px; }
+    .resource-value { margin: 2px 0 12px; font-size: 25px; font-weight: 750; letter-spacing: -.03em; }
+    .core-grid { display: grid; max-height: 170px; gap: 8px 14px; margin-top: 14px; overflow: auto; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
+    .core-item { display: grid; align-items: center; gap: 8px; grid-template-columns: 34px minmax(50px, 1fr) 42px; color: var(--muted); font-size: 11px; }
+    .core-track { height: 6px; overflow: hidden; border-radius: 99px; background: #202c43; }
+    .core-track i { display: block; height: 100%; border-radius: inherit; background: var(--green); transition: width .25s ease; }
+    .concurrency-control { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .concurrency-control .concurrency-input { width: 130px; height: 32px; padding: 0 11px; border: 1px solid var(--el-border-color); border-radius: 4px; background: var(--el-bg-color); color: var(--el-text-color-primary); }
+    .concurrency-control .concurrency-input:focus { border-color: var(--el-color-primary); outline: none; }
+    .pull-form { display: grid; gap: 12px; grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr) auto; align-items: end; }
+    .pull-form .el-form-item { margin: 0; }
+    .selection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .selection-actions a { display: inline-flex; }
+    .row-actions a { display: inline-flex; }
+    .sidebar-mask { display: none; }
+    @media (max-width: 1100px) {
+      .metric-card, .metric-card.wide { flex-basis: calc(50% - 8px); }
+    }
+    @media (max-width: 899px) {
+      .app-shell, .app-shell.is-collapsed { --sidebar-width: 260px; }
+      .sidebar { width: 260px; transform: translateX(-100%); }
+      .sidebar.is-open { transform: translateX(0); }
+      .is-collapsed .brand { justify-content: flex-start; padding-inline: 16px; }
+      .is-collapsed .brand-copy, .is-collapsed .sidebar-note { display: block; }
+      .sidebar-mask {
+        position: fixed;
+        inset: 0;
+        z-index: 25;
+        display: block;
+        background: rgba(3, 7, 18, .68);
+        backdrop-filter: blur(2px);
+      }
+      .workspace { margin-left: 0; }
+      .topbar { padding: 13px 18px; }
+      .content { padding: 20px 18px 34px; }
+      .mobile-menu { display: inline-flex !important; }
+    }
+    @media (max-width: 620px) {
+      .topbar { align-items: flex-start; gap: 10px; padding: 12px; }
+      .topbar-heading { align-items: flex-start; gap: 9px; }
+      .topbar h1 { font-size: 18px; }
+      .topbar p { display: none; }
+      .topbar-actions { gap: 6px; }
+      .topbar-actions .el-tag { display: none; }
+      .content { padding: 14px 12px 30px; }
+      .metrics-grid, .panel-grid { gap: 12px; }
+      .metric-card, .metric-card.wide, .panel, .panel.full, .resource-card { flex-basis: 100%; }
+      .resource-card .el-card__body { padding: 14px; }
+      .pull-form { grid-template-columns: minmax(0, 1fr); }
+      .pull-form .el-button { width: 100%; }
+      .link-form-grid { grid-template-columns: minmax(0, 1fr); }
+      .panel .el-card__body { padding: 14px; }
+      .page-toolbar { align-items: stretch; }
+      .search-input, .toolbar-actions { width: 100%; }
+      .toolbar-actions .el-button { flex: 1; }
+      .key-row .el-button { width: 100%; }
+      .el-descriptions__table .el-descriptions__label { width: 92px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" v-cloak>
+    <div class="app-shell" :class="{ 'is-collapsed': collapsed }">
+      <aside class="sidebar" :class="{ 'is-open': mobileOpen }" aria-label="主导航">
+        <div class="brand">
+          <div class="brand-mark">R</div>
+          <div class="brand-copy">
+            <div class="brand-title">REA Console</div>
+            <div class="brand-subtitle">本地模型控制台</div>
+          </div>
+        </div>
+        <el-menu :default-active="activePage" :collapse="menuCollapsed" @select="navigate">
+          <el-menu-item index="home">
+            <span class="nav-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5M9.5 21v-7h5v7"/></svg>
+            </span>
+            <template #title>主页</template>
+          </el-menu-item>
+          <el-menu-item index="models">
+            <span class="nav-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg>
+            </span>
+            <template #title>模型管理</template>
+          </el-menu-item>
+        </el-menu>
+        <div class="sidebar-footer">
+          <el-button text @click="toggleSidebar" :title="isMobile ? (mobileOpen ? '关闭侧栏' : '打开侧栏') : (collapsed ? '展开侧栏' : '折叠侧栏')">
+            <span aria-hidden="true">{{ isMobile ? (mobileOpen ? '‹' : '›') : (collapsed ? '»' : '«') }}</span>
+            <span v-if="!menuCollapsed && !isMobile" style="margin-left: 6px;">折叠侧栏</span>
+          </el-button>
+          <div class="sidebar-note">最常用模型热启动<br>其余空闲自动回收</div>
+        </div>
+      </aside>
+
+      <div v-if="mobileOpen" class="sidebar-mask" @click="mobileOpen = false"></div>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-heading">
+            <el-button class="mobile-menu" text circle aria-label="打开导航" @click="mobileOpen = true">
+              <span style="font-size: 22px; line-height: 1;" aria-hidden="true">☰</span>
+            </el-button>
+            <div>
+              <h1>{{ pageTitle }}</h1>
+              <p>{{ pageSubtitle }}</p>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <el-tag v-if="stats.queue.queued > 0" type="warning" effect="plain">排队 {{ stats.queue.queued }}</el-tag>
+            <el-tag :type="heartbeatType" effect="plain">{{ heartbeatText }}</el-tag>
+            <el-button :loading="loading" @click="loadStats">刷新</el-button>
+          </div>
+        </header>
+
+        <main class="content">
+          <el-alert v-if="loadError" class="page-alert" :title="loadError" type="error" show-icon closable @close="loadError = ''"></el-alert>
+
+          <template v-if="activePage === 'home'">
+            <section class="metrics-grid" aria-label="服务概览">
+              <el-card class="metric-card" shadow="hover">
+                <div class="metric-label">累计 Token</div>
+                <el-statistic :value="stats.totals.totalTokens" :formatter="formatCompact"></el-statistic>
+                <div class="metric-foot">输入 {{ formatCompact(stats.totals.promptTokens) }} · 输出 {{ formatCompact(stats.totals.completionTokens) }}</div>
+              </el-card>
+              <el-card class="metric-card" shadow="hover">
+                <div class="metric-label">累计请求</div>
+                <el-statistic :value="stats.totals.requests" :formatter="formatCompact"></el-statistic>
+                <div class="metric-foot">成功 {{ formatCompact(stats.totals.successfulRequests) }} · 失败 {{ formatCompact(stats.totals.failedRequests) }}</div>
+              </el-card>
+              <el-card class="metric-card" shadow="hover">
+                <div class="metric-label">推理队列</div>
+                <div class="metric-value">{{ stats.queue.active }} / {{ stats.queue.maxActive }}</div>
+                <div class="metric-foot">等待 {{ stats.queue.queued }} · 队列上限 {{ stats.queue.maxQueue }}</div>
+              </el-card>
+              <el-card class="metric-card wide" shadow="hover">
+                <div class="metric-label">服务运行</div>
+                <div class="metric-value">{{ formatUptime(stats.uptimeSeconds) }}</div>
+                <div class="metric-foot">{{ lastUpdated ? `更新于 ${formatDate(lastUpdated)}` : '等待首次刷新' }}</div>
+              </el-card>
+            </section>
+
+            <section class="resource-grid" aria-label="本机资源">
+              <el-card class="resource-card" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>CPU</h2><p>{{ stats.system?.cpu?.cores || 0 }} 个逻辑核心</p></div>
+                  <el-tag :type="pressureType(stats.system?.cpu?.usagePercent)" effect="plain">{{ formatPercent(stats.system?.cpu?.usagePercent) }}</el-tag>
+                </div>
+                <div class="resource-value">{{ formatPercent(stats.system?.cpu?.usagePercent) }}</div>
+                <el-progress :percentage="percentValue(stats.system?.cpu?.usagePercent)" :color="pressureColor(stats.system?.cpu?.usagePercent)" :stroke-width="9"></el-progress>
+                <div class="metric-foot">1 / 5 / 15 分钟负载：{{ (stats.system?.cpu?.loadAverage || [0, 0, 0]).map((value) => Number(value).toFixed(2)).join(' / ') }}</div>
+                <div class="core-grid">
+                  <div v-for="(value, index) in (stats.system?.cpu?.perCore || [])" :key="index" class="core-item">
+                    <span>#{{ index + 1 }}</span>
+                    <div class="core-track"><i :style="{ width: percentValue(value) + '%', background: pressureColor(value) }"></i></div>
+                    <span>{{ formatPercent(value) }}</span>
+                  </div>
+                </div>
+              </el-card>
+
+              <el-card class="resource-card" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>内存</h2><p>系统与推理进程占用</p></div>
+                  <el-tag :type="pressureType(memoryPercent)" effect="plain">{{ formatPercent(memoryPercent) }}</el-tag>
+                </div>
+                <div class="resource-value">{{ formatBytes(stats.system?.memory?.usedBytes) }} <span class="metric-foot">/ {{ formatBytes(stats.system?.memory?.totalBytes) }}</span></div>
+                <el-progress :percentage="percentValue(memoryPercent)" :color="pressureColor(memoryPercent)" :stroke-width="9"></el-progress>
+                <div class="metric-foot">Node {{ formatBytes(stats.serverRssBytes) }} · 推理 {{ formatBytes(stats.system?.memory?.runtimeBytes) }} · 可用 {{ formatBytes(stats.system?.memory?.freeBytes) }}</div>
+              </el-card>
+
+              <el-card class="resource-card" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>硬盘</h2><p>模型所在磁盘分区</p></div>
+                  <el-tag :type="pressureType(diskPercent)" effect="plain">{{ formatPercent(diskPercent) }}</el-tag>
+                </div>
+                <div class="resource-value">{{ formatBytes(stats.system?.disk?.usedBytes) }} <span class="metric-foot">/ {{ formatBytes(stats.system?.disk?.totalBytes) }}</span></div>
+                <el-progress :percentage="percentValue(diskPercent)" :color="pressureColor(diskPercent)" :stroke-width="9"></el-progress>
+                <div class="metric-foot">模型目录 {{ formatBytes(stats.system?.disk?.modelBytes) }} · 可用 {{ formatBytes(stats.system?.disk?.freeBytes) }}</div>
+              </el-card>
+            </section>
+
+            <section class="panel-grid" style="margin-top: 16px;">
+              <el-card class="panel" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>运行与资源</h2><p>最常用模型常驻，其余实例按并发上限驻留并空闲回收</p></div>
+                  <el-tag :type="stats.runtime ? 'success' : 'info'" effect="plain">{{ stats.runtime ? (stats.runtime.status === 'loaded' ? '运行中' : '加载中') : '内存已回收' }}</el-tag>
+                </div>
+                <el-descriptions :column="2" border>
+                  <el-descriptions-item label="当前模型" :span="2"><span class="description-value">{{ stats.runtime?.id || '未加载' }}</span></el-descriptions-item>
+                  <el-descriptions-item label="热启动模型" :span="2"><span class="description-value">{{ stats.hotModelId || '未选择' }}</span><el-tag v-if="stats.hotModelPinned" size="small" type="warning" effect="plain">HOT_MODEL 固定</el-tag></el-descriptions-item>
+                  <el-descriptions-item label="总 RSS">{{ formatBytes(stats.runtime?.rssBytes ?? stats.serverRssBytes) }}</el-descriptions-item>
+                  <el-descriptions-item label="上下文大小">{{ stats.runtime?.contextSize ? formatCompact(stats.runtime.contextSize) : '—' }}</el-descriptions-item>
+                  <el-descriptions-item label="模型内存">{{ stats.runtime ? formatBytes(stats.runtime.modelBytes) : '—' }}</el-descriptions-item>
+                  <el-descriptions-item label="上下文内存">{{ stats.runtime ? formatBytes(stats.runtime.contextMemory?.ram || 0) : '—' }}</el-descriptions-item>
+                  <el-descriptions-item label="闲置回收">{{ Math.round(stats.modelIdleTimeoutMs / 1000) }} 秒</el-descriptions-item>
+                  <el-descriptions-item label="内存上限">{{ formatBytes(stats.memoryLimitBytes) }}</el-descriptions-item>
+                  <el-descriptions-item label="推理实例">{{ stats.runtime?.instanceCount || 0 }} 个</el-descriptions-item>
+                  <el-descriptions-item label="队列状态">活跃 {{ stats.queue.active }} · 排队 {{ stats.queue.queued }}</el-descriptions-item>
+                </el-descriptions>
+                <div class="metric-foot">自动按成功调用次数选择热模型；设置 HOT_MODEL 可固定指定模型。</div>
+              </el-card>
+
+              <el-card class="panel" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>并发与排队</h2><p>超出并发上限的请求自动进入等待队列</p></div>
+                  <el-tag :type="stats.queue.queued > 0 ? 'warning' : 'success'" effect="plain">{{ stats.queue.queued > 0 ? `排队 ${stats.queue.queued}` : '无排队' }}</el-tag>
+                </div>
+                <div class="concurrency-control">
+                  <input v-model.number="concurrencyDraft" @focus="concurrencyDirty = true" class="el-input__inner concurrency-input" type="number" min="1" :max="stats.maxConcurrencyLimit || 8" :disabled="concurrencyBusy" aria-label="推理并发数">
+                  <el-button type="primary" :loading="concurrencyBusy" @click="applyConcurrency">应用并发</el-button>
+                </div>
+                <el-alert v-if="stats.queue.queued > 0" class="upload-status" :title="`当前有 ${stats.queue.queued} 个请求正在排队，活跃 ${stats.queue.active} / ${stats.queue.maxActive}`" type="warning" show-icon></el-alert>
+                <div class="metric-foot">并发越高，CPU 争用和内存占用越大；系统会按内存预算阻止超额驻留。</div>
+              </el-card>
+
+              <el-card class="panel" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>资源与地址</h2><p>OpenAI 兼容接口</p></div>
+                  <el-button text type="primary" @click="navigate('models')">管理模型</el-button>
+                </div>
+                <div class="metric-label">聊天补全</div>
+                <div class="endpoint-row"><code>{{ apiUrl }}</code><el-button text @click="copyText(apiUrl)">复制</el-button></div>
+                <div class="metric-label" style="margin-top: 16px;">模型列表</div>
+                <div class="endpoint-row"><code>{{ modelsUrl }}</code><el-button text @click="copyText(modelsUrl)">复制</el-button></div>
+                <el-divider></el-divider>
+                <div class="status-line"><span class="metric-label">请求方式</span><code>Authorization: Bearer &lt;key&gt;</code></div>
+                <div class="status-line" style="margin-top: 10px;"><span class="metric-label">模型选择</span><span>请求 body.model 使用模型完整文件名</span></div>
+                <div class="status-line" style="margin-top: 10px;"><span class="metric-label">模型数量</span><span>{{ stats.models.length }} 个 · 当前 {{ stats.runtime?.id || '无驻留模型' }}</span></div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>访问密钥</h2><p>页面按个人使用需求直接展示密钥</p></div>
+                  <el-button type="primary" plain @click="copyText(config.apiKey)">复制 API Key</el-button>
+                </div>
+                <div class="key-row"><code>{{ config.apiKey }}</code></div>
+                <div class="metric-foot">控制台无需登录；公网部署时请自行配置访问白名单或反向代理鉴权。</div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>每日用量</h2><p>最多展示最近 14 天</p></div>
+                  <el-button text type="danger" :disabled="usageBusy" @click="clearUsage">清空累计</el-button>
+                </div>
+                <div class="table-shell">
+                  <el-table class="usage-table" :data="stats.daily" size="small" empty-text="暂无用量数据">
+                    <el-table-column prop="date" label="日期" min-width="130"></el-table-column>
+                    <el-table-column label="请求" min-width="100" align="right"><template #default="{ row }">{{ formatCompact(row.requests) }}</template></el-table-column>
+                    <el-table-column label="成功" min-width="100" align="right"><template #default="{ row }">{{ formatCompact(row.successfulRequests) }}</template></el-table-column>
+                    <el-table-column label="输入 Token" min-width="120" align="right"><template #default="{ row }">{{ formatCompact(row.promptTokens) }}</template></el-table-column>
+                    <el-table-column label="输出 Token" min-width="120" align="right"><template #default="{ row }">{{ formatCompact(row.completionTokens) }}</template></el-table-column>
+                    <el-table-column label="合计" min-width="110" align="right"><template #default="{ row }">{{ formatCompact(row.promptTokens + row.completionTokens) }}</template></el-table-column>
+                  </el-table>
+                </div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading"><div><h2>近期请求</h2><p>仅记录 token、耗时和状态，不保存请求正文</p></div></div>
+                <div class="table-shell">
+                  <el-table class="usage-table" :data="stats.recent" size="small" empty-text="暂无请求记录">
+                    <el-table-column label="时间" min-width="165"><template #default="{ row }">{{ formatDate(row.timestamp) }}</template></el-table-column>
+                    <el-table-column label="模型" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ row.model || '—' }}</template></el-table-column>
+                    <el-table-column label="状态" min-width="90"><template #default="{ row }"><el-tag size="small" :type="row.status === 'success' ? 'success' : 'danger'">{{ row.status === 'success' ? '成功' : '失败' }}</el-tag></template></el-table-column>
+                    <el-table-column label="模式" min-width="90"><template #default="{ row }">{{ row.stream ? '流式' : '非流式' }}</template></el-table-column>
+                    <el-table-column label="输入" min-width="85" align="right"><template #default="{ row }">{{ formatCompact(row.promptTokens) }}</template></el-table-column>
+                    <el-table-column label="输出" min-width="85" align="right"><template #default="{ row }">{{ formatCompact(row.completionTokens) }}</template></el-table-column>
+                    <el-table-column label="耗时" min-width="100" align="right"><template #default="{ row }">{{ formatCompact(row.latencyMs) }} ms</template></el-table-column>
+                    <el-table-column label="结束原因" min-width="130"><template #default="{ row }">{{ row.status === 'success' ? (row.finishReason || 'stop') : (row.errorCode || 'error') }}</template></el-table-column>
+                  </el-table>
+                </div>
+              </el-card>
+            </section>
+          </template>
+
+          <template v-else>
+            <section class="panel-grid">
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>从 URL 拉取模型</h2><p>服务器直接下载 GGUF，无需先保存到本地电脑</p></div>
+                  <el-tag effect="plain">HTTP / HTTPS</el-tag>
+                </div>
+                <el-form label-position="top" @submit.prevent>
+                  <div class="pull-form">
+                    <el-form-item label="模型地址" required>
+                      <el-input v-model="pullUrl" clearable placeholder="https://huggingface.co/.../resolve/main/model.gguf"></el-input>
+                    </el-form-item>
+                    <el-form-item label="保存文件名（可选）">
+                      <el-input v-model="pullName" clearable placeholder="留空则自动识别文件名"></el-input>
+                    </el-form-item>
+                    <el-button type="success" :loading="pulling" :disabled="pulling" @click="pullModel">拉取模型</el-button>
+                  </div>
+                </el-form>
+                <div v-if="pulling" class="metric-foot" style="margin-bottom: 12px;">正在拉取{{ stats.transfer?.filename ? ` ${stats.transfer.filename}` : '' }}：已下载 {{ formatBytes(stats.transfer?.receivedBytes) }}{{ stats.transfer?.totalBytes ? ` / ${formatBytes(stats.transfer.totalBytes)}` : '' }}</div>
+                <el-progress v-if="pulling && pullPercent > 0" :percentage="pullPercent" :stroke-width="10" style="margin: 4px 0 14px;"></el-progress>
+                <el-alert v-if="pullError" class="upload-status" :title="pullError" type="error" show-icon closable @close="pullError = ''"></el-alert>
+                <el-alert v-else-if="pullMessage" class="upload-status" :title="pullMessage" type="success" show-icon closable @close="pullMessage = ''"></el-alert>
+                <div class="metric-foot">默认仅允许公网地址；内网模型仓库可通过 MODEL_PULL_ALLOW_PRIVATE=true 开启。</div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>模型链接配置</h2><p>保存到 {{ modelLinksFile }}；手动拉取成功后自动写入链接与校验信息</p></div>
+                  <el-tag effect="plain">{{ enabledLinkCount }} 启用 · {{ missingLinkCount }} 缺失</el-tag>
+                </div>
+                <div class="page-toolbar">
+                  <span class="metric-foot">差异拉取只下载启用且本地缺失的模型，不覆盖或删除已有文件。</span>
+                  <div class="toolbar-actions">
+                    <el-button :disabled="linkBusy || syncingLinks" @click="openLinkEditor()">新增链接</el-button>
+                    <el-button tag="a" type="primary" href="/admin/api/model-links/export" download>导出备份</el-button>
+                    <el-button type="success" :loading="syncingLinks" :disabled="syncingLinks || linkBusy" @click="pullMissingLinks">一键差异化拉取</el-button>
+                  </div>
+                </div>
+                <div v-if="syncingLinks" class="metric-foot" style="margin-bottom: 12px;">正在按配置补齐模型{{ stats.transfer?.filename ? `：${stats.transfer.filename}` : '' }}，已下载 {{ formatBytes(stats.transfer?.receivedBytes) }}{{ stats.transfer?.totalBytes ? ` / ${formatBytes(stats.transfer.totalBytes)}` : '' }}</div>
+                <el-progress v-if="syncingLinks && pullPercent > 0" :percentage="pullPercent" :stroke-width="10" style="margin-bottom: 14px;"></el-progress>
+                <el-alert v-if="modelLinksError" class="upload-status" :title="modelLinksError" type="error" show-icon closable @close="modelLinksError = ''"></el-alert>
+                <el-alert v-else-if="syncError" class="upload-status" :title="syncError" type="warning" show-icon closable @close="syncError = ''"></el-alert>
+                <el-alert v-else-if="syncMessage" class="upload-status" :title="syncMessage" type="success" show-icon closable @close="syncMessage = ''"></el-alert>
+                <div class="table-shell">
+                  <el-table v-loading="linkLoading" class="link-config-table" :data="modelLinks" row-key="id" empty-text="暂无模型链接配置">
+                    <el-table-column label="启用" width="82" align="center">
+                      <template #default="{ row }"><el-switch :model-value="row.enabled" :loading="linkActionId === row.id" :disabled="linkBusy || syncingLinks" @change="toggleModelLink(row, $event)"></el-switch></template>
+                    </el-table-column>
+                    <el-table-column label="模型文件" min-width="250"><template #default="{ row }"><span class="model-id" :title="row.id">{{ row.id }}</span></template></el-table-column>
+                    <el-table-column label="下载链接" min-width="360" show-overflow-tooltip><template #default="{ row }"><span class="link-url">{{ row.url }}</span></template></el-table-column>
+                    <el-table-column label="完整性校验" min-width="165">
+                      <template #default="{ row }">
+                        <div>{{ row.sizeBytes ? formatBytes(row.sizeBytes) : '大小未校验' }}</div>
+                        <code>{{ row.sha256 ? `${row.sha256.slice(0, 12)}…` : '未设置 SHA-256' }}</code>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="本地状态" min-width="135">
+                      <template #default="{ row }"><el-tag size="small" :type="linkLocalStatusType(row.localStatus)">{{ linkLocalStatusText(row.localStatus) }}</el-tag><div v-if="row.localStatus === 'size_mismatch'" class="metric-foot">本地 {{ formatBytes(row.localSizeBytes) }}</div></template>
+                    </el-table-column>
+                    <el-table-column label="最近拉取" min-width="165"><template #default="{ row }">{{ formatDate(row.lastPulledAt) }}</template></el-table-column>
+                    <el-table-column label="操作" min-width="165" fixed="right">
+                      <template #default="{ row }">
+                        <div class="row-actions">
+                          <el-button size="small" :disabled="linkBusy || syncingLinks" @click="openLinkEditor(row)">编辑</el-button>
+                          <el-button size="small" type="danger" plain :disabled="linkBusy || syncingLinks" @click="deleteModelLink(row)">删除</el-button>
+                        </div>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+                <div class="metric-foot">配置可直接编辑 JSON；管理台每次查询都会重新读取。下载完成后会校验文件大小与 SHA-256。</div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>模型目录</h2><p>共 {{ stats.models.length }} 个模型，搜索到 {{ filteredModels.length }} 个；文件名即模型 ID</p></div>
+                  <el-tag effect="plain">单文件上限 {{ formatBytes(stats.maxModelBytes) }}</el-tag>
+                </div>
+                <div class="page-toolbar">
+                  <el-input v-model="modelSearch" class="search-input" clearable placeholder="搜索模型文件名或模型名称">
+                    <template #prefix><span aria-hidden="true">⌕</span></template>
+                  </el-input>
+                  <div class="toolbar-actions">
+                    <input ref="fileInput" type="file" accept=".gguf" hidden>
+                    <el-button type="primary" :disabled="uploading" @click="selectFile">选择 GGUF 模型</el-button>
+                    <el-button type="success" :loading="uploading" :disabled="uploading" @click="uploadModel">上传模型</el-button>
+                  </div>
+                </div>
+                <el-progress v-if="uploading" :percentage="uploadPercent" :stroke-width="10" style="margin-bottom: 14px;"></el-progress>
+                <el-alert v-if="uploadError" class="upload-status" :title="uploadError" type="error" show-icon closable @close="uploadError = ''"></el-alert>
+                <el-alert v-else-if="uploadMessage" class="upload-status" :title="uploadMessage" type="success" show-icon closable @close="uploadMessage = ''"></el-alert>
+                <div class="selection-actions" style="margin-bottom: 12px;">
+                  <el-button size="small" :disabled="filteredModels.length === 0" @click="toggleAllVisible(true)">全选当前</el-button>
+                  <el-button size="small" :disabled="selectedModels.length === 0" @click="selectedModels = []">清空选择</el-button>
+                  <el-button tag="a" size="small" type="primary" :href="selectedModels.length ? batchDownloadUrl : undefined" :disabled="selectedModels.length === 0">批量下载 ZIP（{{ selectedModels.length }}）</el-button>
+                  <span class="metric-foot">批量下载会在服务器端流式打包，不额外占用模型内存。</span>
+                </div>
+                <div class="table-shell">
+                  <el-table v-loading="loading" class="model-table" :data="filteredModels" row-key="id" empty-text="暂无模型，请先上传 GGUF 文件">
+                    <el-table-column width="46" align="center">
+                      <template #header><el-checkbox :model-value="allVisibleSelected" :indeterminate="someVisibleSelected" :disabled="filteredModels.length === 0" @change="toggleAllVisible"></el-checkbox></template>
+                      <template #default="{ row }"><el-checkbox :model-value="selectedModels.includes(row.id)" @change="toggleModel(row.id, $event)"></el-checkbox></template>
+                    </el-table-column>
+                    <el-table-column label="模型文件" min-width="280"><template #default="{ row }"><span class="model-id" :title="row.id">{{ row.id }}</span></template></el-table-column>
+                    <el-table-column label="大小" min-width="110" align="right"><template #default="{ row }">{{ formatBytes(row.sizeBytes) }}</template></el-table-column>
+                    <el-table-column label="状态" min-width="150"><template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ statusText(row.status) }}</el-tag><el-tag v-if="row.isHot" size="small" type="warning" effect="dark" style="margin-left: 6px;">热启动</el-tag></template></el-table-column>
+                    <el-table-column label="创建时间" min-width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+                    <el-table-column label="最近使用" min-width="170"><template #default="{ row }">{{ row.lastUsedAt ? formatDate(row.lastUsedAt) : '—' }}</template></el-table-column>
+                    <el-table-column label="上下文" min-width="100" align="right"><template #default="{ row }">{{ row.contextSize ? formatCompact(row.contextSize) : '—' }}</template></el-table-column>
+                    <el-table-column label="操作" min-width="430" fixed="right">
+                      <template #default="{ row }">
+                        <div class="row-actions">
+                          <a :href="modelDownloadUrl(row)" title="下载模型"><el-button size="small">下载</el-button></a>
+                          <el-button size="small" :type="row.status === 'unloaded' ? 'primary' : 'warning'" plain :loading="actionModel === row.id" :disabled="row.isHot || (actionLoading && actionModel !== row.id)" @click="modelAction(row.status === 'unloaded' ? 'load' : 'unload', row)">{{ row.isHot ? '热启动常驻' : (row.status === 'unloaded' ? '加载' : '卸载') }}</el-button>
+                          <el-button size="small" :disabled="row.status === 'loading' || actionLoading" @click="openRename(row)">重命名</el-button>
+                          <el-button size="small" type="danger" plain :disabled="row.status === 'loading' || actionLoading" @click="modelAction('delete', row)">删除</el-button>
+                        </div>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+                <div class="metric-foot">模型从 models 目录自动发现；热启动模型保持常驻，其余推理实例闲置后自动回收。</div>
+              </el-card>
+            </section>
+          </template>
+
+          <footer class="footer">REA Model Console · Vue 3 + Element Plus · 数据仅保存在本机</footer>
+        </main>
+      </div>
+    </div>
+
+    <el-dialog v-model="renameDialog" title="重命名模型" width="min(500px, calc(100vw - 28px))" @closed="renameName = ''">
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item label="当前模型"><code>{{ renameModel?.id || '—' }}</code></el-form-item>
+        <el-form-item label="新文件名" required>
+          <el-input v-model="renameName" maxlength="240" clearable autofocus placeholder="例如：中文决策模型.gguf" @keyup.enter="confirmRename"></el-input>
+        </el-form-item>
+        <div class="dialog-tip">名称将直接作为新的模型 ID，必须以 .gguf 结尾，且不能包含路径或非法字符。</div>
+      </el-form>
+      <template #footer>
+        <el-button @click="renameDialog = false">取消</el-button>
+        <el-button type="primary" :loading="renaming" @click="confirmRename">保存名称</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="linkDialog" :title="linkDialogTitle" width="min(640px, calc(100vw - 28px))" @closed="resetLinkEditor">
+      <el-form label-position="top" @submit.prevent>
+        <div class="link-form-grid">
+          <el-form-item label="保存文件名" required class="full">
+            <el-input v-model="linkForm.id" maxlength="240" clearable placeholder="例如：Qwen3.5-2B-Q4_K_M.gguf"></el-input>
+          </el-form-item>
+          <el-form-item label="模型下载地址" required class="full">
+            <el-input v-model="linkForm.url" clearable placeholder="https://huggingface.co/.../resolve/main/model.gguf"></el-input>
+          </el-form-item>
+          <el-form-item label="期望大小（字节，可选）">
+            <el-input v-model="linkForm.sizeBytes" inputmode="numeric" clearable placeholder="留空则不校验大小"></el-input>
+          </el-form-item>
+          <el-form-item label="SHA-256（可选）">
+            <el-input v-model="linkForm.sha256" maxlength="64" clearable placeholder="64 位十六进制字符串"></el-input>
+          </el-form-item>
+          <el-form-item label="参与差异拉取" class="full">
+            <el-switch v-model="linkForm.enabled"></el-switch>
+          </el-form-item>
+        </div>
+        <div class="dialog-tip">文件名将作为本地模型 ID；地址仅支持公网 HTTP/HTTPS，下载完成后自动校验并保存。</div>
+      </el-form>
+      <template #footer>
+        <el-button @click="linkDialog = false">取消</el-button>
+        <el-button type="primary" :loading="linkBusy" @click="saveModelLink">保存配置</el-button>
+      </template>
+    </el-dialog>
+  </div>
+
+  <div id="boot-error" hidden style="position: fixed; inset: 24px; z-index: 100; display: grid; place-items: center; padding: 24px; border: 1px solid #6e303a; border-radius: 12px; background: #351c28; color: #ffc2c8; text-align: center;">
+    Vue 3 或 Element Plus CDN 加载失败，请检查服务器网络后刷新页面。
+  </div>
+
+  <script id="runtime-config" type="application/json">__RUNTIME_CONFIG__</script>
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/element-plus@2.11.5/dist/index.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/element-plus@2.11.5/dist/locale/zh-cn.min.js"></script>
+  <script>
+    (() => {
+      const bootError = document.getElementById('boot-error')
+      if (!window.Vue || !window.ElementPlus) {
+        bootError.hidden = false
+        bootError.style.display = 'grid'
+        return
+      }
+
+      const { createApp, ref, computed, onMounted, onBeforeUnmount } = Vue
+      const { ElMessage, ElMessageBox } = ElementPlus
+      const config = JSON.parse(document.getElementById('runtime-config').textContent)
+      const number = new Intl.NumberFormat('zh-CN')
+      const dateTime = new Intl.DateTimeFormat('zh-CN', { hour12: false })
+
+      function emptyStats() {
+        return {
+          models: [],
+          runtime: null,
+          serverRssBytes: 0,
+          memoryLimitBytes: 0,
+          modelIdleTimeoutMs: 0,
+          maxModelBytes: 0,
+          maxConcurrencyLimit: 8,
+          hotModelId: null,
+          hotModelPinned: false,
+          system: {
+            cpu: { usagePercent: 0, cores: 0, perCore: [], loadAverage: [0, 0, 0] },
+            memory: { totalBytes: 0, freeBytes: 0, usedBytes: 0, runtimeBytes: 0 },
+            disk: { totalBytes: 0, freeBytes: 0, usedBytes: 0, modelBytes: 0 },
+          },
+          transfer: null,
+          publicBaseUrl: config.publicBaseUrl,
+          uptimeSeconds: 0,
+          queue: { active: 0, queued: 0, maxActive: 1, maxQueue: 0 },
+          heartbeat: { enabled: false, lastSuccessAt: null, lastError: null },
+          totals: { requests: 0, successfulRequests: 0, failedRequests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          daily: [],
+          recent: [],
+        }
+      }
+
+      const app = createApp({
+        setup() {
+          const activePage = ref(location.hash === '#models' ? 'models' : 'home')
+          const collapsed = ref(false)
+          const isMobile = ref(window.innerWidth < 900)
+          const mobileOpen = ref(false)
+          const stats = ref(emptyStats())
+          const loading = ref(false)
+          const loadError = ref('')
+          const lastUpdated = ref(null)
+          const modelSearch = ref('')
+          const fileInput = ref(null)
+          const uploading = ref(false)
+          const uploadPercent = ref(0)
+          const uploadMessage = ref('')
+          const uploadError = ref('')
+          const pullUrl = ref('')
+          const pullName = ref('')
+          const pulling = ref(false)
+          const pullMessage = ref('')
+          const pullError = ref('')
+          const modelLinks = ref([])
+          const modelLinksFile = ref('models.config.json')
+          const linkLoading = ref(false)
+          const modelLinksError = ref('')
+          const linkBusy = ref(false)
+          const linkActionId = ref('')
+          const syncingLinks = ref(false)
+          const syncMessage = ref('')
+          const syncError = ref('')
+          const linkDialog = ref(false)
+          const linkEditingId = ref(null)
+          const linkForm = ref({ id: '', url: '', enabled: true, sizeBytes: '', sha256: '' })
+          const selectedModels = ref([])
+          const concurrencyDraft = ref(1)
+          const concurrencyDirty = ref(false)
+          const concurrencyBusy = ref(false)
+          const actionLoading = ref(false)
+          const actionModel = ref('')
+          const usageBusy = ref(false)
+          const renameDialog = ref(false)
+          const renameName = ref('')
+          const renameModel = ref(null)
+          const renaming = ref(false)
+          let refreshTimer = null
+
+          try { collapsed.value = localStorage.getItem('rea-sidebar-collapsed') === 'true' } catch {}
+
+          const pageTitle = computed(() => activePage.value === 'home' ? 'REA Model Console' : '模型管理')
+          const pageSubtitle = computed(() => activePage.value === 'home' ? '模型目录、按需推理、资源回收与 Token 消耗' : '上传、查询、重命名、加载、卸载与删除模型')
+          const menuCollapsed = computed(() => collapsed.value && !isMobile.value)
+          const filteredModels = computed(() => {
+            const query = modelSearch.value.trim().toLowerCase()
+            if (!query) return stats.value.models
+            return stats.value.models.filter((item) => item.id.toLowerCase().includes(query) || item.name.toLowerCase().includes(query))
+          })
+          const allVisibleSelected = computed(() => filteredModels.value.length > 0 && filteredModels.value.every((item) => selectedModels.value.includes(item.id)))
+          const someVisibleSelected = computed(() => filteredModels.value.some((item) => selectedModels.value.includes(item.id)) && !allVisibleSelected.value)
+          const batchDownloadUrl = computed(() => {
+            const params = new URLSearchParams()
+            selectedModels.value.forEach((id) => params.append('model', id))
+            return `/admin/api/models/batch-download?${params.toString()}`
+          })
+          const enabledLinkCount = computed(() => modelLinks.value.filter((item) => item.enabled).length)
+          const missingLinkCount = computed(() => modelLinks.value.filter((item) => item.enabled && item.localStatus === 'missing').length)
+          const linkDialogTitle = computed(() => linkEditingId.value ? '编辑模型链接' : '新增模型链接')
+          const memoryPercent = computed(() => {
+            const memory = stats.value.system?.memory
+            return memory?.totalBytes > 0 ? memory.usedBytes / memory.totalBytes * 100 : 0
+          })
+          const diskPercent = computed(() => {
+            const disk = stats.value.system?.disk
+            return disk?.totalBytes > 0 ? disk.usedBytes / disk.totalBytes * 100 : 0
+          })
+          const pullPercent = computed(() => {
+            const transfer = stats.value.transfer
+            if (!transfer || !['pull', 'model-links-sync'].includes(transfer.type)) return 0
+            if (transfer.totalBytes > 0) return Math.min(100, Math.round(transfer.receivedBytes / transfer.totalBytes * 100))
+            return 0
+          })
+          const apiUrl = computed(() => `${stats.value.publicBaseUrl}/v1/chat/completions`)
+          const modelsUrl = computed(() => `${stats.value.publicBaseUrl}/v1/models`)
+          const heartbeatText = computed(() => {
+            const heartbeat = stats.value.heartbeat
+            if (!heartbeat.enabled) return '保活已关闭'
+            if (heartbeat.lastError) return '保活异常'
+            if (heartbeat.lastSuccessAt) return `保活正常 · ${formatDate(heartbeat.lastSuccessAt)}`
+            return '等待首次心跳'
+          })
+          const heartbeatType = computed(() => {
+            const heartbeat = stats.value.heartbeat
+            if (!heartbeat.enabled) return 'info'
+            return heartbeat.lastError ? 'danger' : heartbeat.lastSuccessAt ? 'success' : 'warning'
+          })
+
+          function formatNumber(value) { return number.format(Number(value) || 0) }
+          function formatCompact(value) {
+            const count = Number(value) || 0
+            if (count >= 1e9) return `${(count / 1e9).toFixed(2)}B`
+            if (count >= 1e6) return `${(count / 1e6).toFixed(2)}M`
+            if (count >= 1e3) return `${(count / 1e3).toFixed(2)}K`
+            return formatNumber(count)
+          }
+          function formatBytes(value) {
+            const bytes = Number(value) || 0
+            if (bytes < 1024) return `${bytes} B`
+            if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`
+            if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
+            return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
+          }
+          function percentValue(value) { return Math.max(0, Math.min(100, Math.round(Number(value) || 0))) }
+          function formatPercent(value) { return `${percentValue(value)}%` }
+          function pressureType(value) {
+            const percent = percentValue(value)
+            return percent >= 85 ? 'danger' : percent >= 60 ? 'warning' : 'success'
+          }
+          function pressureColor(value) {
+            const percent = percentValue(value)
+            return percent >= 85 ? '#ff7b86' : percent >= 60 ? '#e6a23c' : '#55d6a5'
+          }
+          function formatUptime(seconds) {
+            const value = Number(seconds) || 0
+            const days = Math.floor(value / 86400)
+            const hours = Math.floor(value % 86400 / 3600)
+            const minutes = Math.floor(value % 3600 / 60)
+            return days > 0 ? `${days}天 ${hours}小时` : `${hours}小时 ${minutes}分`
+          }
+          function formatDate(value) {
+            if (!value) return '—'
+            const date = new Date(value)
+            return Number.isNaN(date.getTime()) ? '—' : dateTime.format(date)
+          }
+          function statusText(status) {
+            return status === 'loaded' ? '运行中' : status === 'loading' ? '加载中' : '未加载'
+          }
+          function statusType(status) {
+            return status === 'loaded' ? 'success' : status === 'loading' ? 'warning' : 'info'
+          }
+          function linkLocalStatusText(status) {
+            return status === 'present' ? '已存在' : status === 'size_mismatch' ? '大小不一致' : '缺失'
+          }
+          function linkLocalStatusType(status) {
+            return status === 'present' ? 'success' : status === 'size_mismatch' ? 'warning' : 'danger'
+          }
+
+          async function request(path, options = {}) {
+            const headers = { Authorization: `Bearer ${config.adminKey}`, ...(options.headers || {}) }
+            if (options.body && !(options.body instanceof FormData)) headers['Content-Type'] = 'application/json'
+            const response = await fetch(path, { ...options, headers })
+            const payload = await response.json().catch(() => ({}))
+            if (!response.ok) throw new Error(payload.error?.message || `HTTP ${response.status}`)
+            return payload
+          }
+
+          async function loadStats() {
+            if (loading.value) return
+            loading.value = true
+            try {
+              stats.value = await request('/admin/api/stats')
+              const available = new Set(stats.value.models.map((item) => item.id))
+              selectedModels.value = selectedModels.value.filter((id) => available.has(id))
+              if (!concurrencyBusy.value && !concurrencyDirty.value) concurrencyDraft.value = stats.value.queue.maxActive
+              lastUpdated.value = new Date().toISOString()
+              loadError.value = ''
+              loadModelLinks()
+            } catch (error) {
+              loadError.value = `加载失败：${error.message}`
+            } finally {
+              loading.value = false
+            }
+          }
+
+          async function loadModelLinks() {
+            if (linkLoading.value) return
+            linkLoading.value = true
+            try {
+              const payload = await request('/admin/api/model-links')
+              modelLinks.value = payload.models
+              modelLinksFile.value = payload.file
+              modelLinksError.value = ''
+            } catch (error) {
+              modelLinksError.value = `链接配置加载失败：${error.message}`
+            } finally {
+              linkLoading.value = false
+            }
+          }
+
+          function navigate(page) {
+            activePage.value = page === 'models' ? 'models' : 'home'
+            mobileOpen.value = false
+            if (location.hash !== `#${activePage.value}`) location.hash = activePage.value
+          }
+
+          function toggleSidebar() {
+            if (isMobile.value) mobileOpen.value = !mobileOpen.value
+            else {
+              collapsed.value = !collapsed.value
+              try { localStorage.setItem('rea-sidebar-collapsed', String(collapsed.value)) } catch {}
+            }
+          }
+
+          async function copyText(text) {
+            try {
+              if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+              else {
+                const textarea = document.createElement('textarea')
+                textarea.value = text
+                textarea.style.position = 'fixed'
+                textarea.style.opacity = '0'
+                document.body.appendChild(textarea)
+                textarea.select()
+                document.execCommand('copy')
+                textarea.remove()
+              }
+              ElMessage.success('已复制')
+            } catch {
+              ElMessage.error('复制失败，请手动选择文本')
+            }
+          }
+
+          async function clearUsage() {
+            try {
+              await ElMessageBox.confirm('确定清空全部累计、每日和近期请求统计吗？此操作不可撤销。', '清空累计用量', { type: 'warning', confirmButtonText: '确认清空', cancelButtonText: '取消' })
+            } catch { return }
+            usageBusy.value = true
+            try {
+              await request('/admin/api/reset-usage', { method: 'POST' })
+              ElMessage.success('累计用量已清空')
+              await loadStats()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              usageBusy.value = false
+            }
+          }
+
+          async function applyConcurrency() {
+            concurrencyBusy.value = true
+            try {
+              const payload = await request('/admin/api/concurrency', {
+                method: 'POST',
+                body: JSON.stringify({ concurrency: concurrencyDraft.value }),
+              })
+              stats.value.queue = payload.queue
+              concurrencyDirty.value = false
+              ElMessage.success(`推理并发已设置为 ${payload.queue.maxActive}`)
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              concurrencyBusy.value = false
+            }
+          }
+
+          function toggleModel(id, checked) {
+            selectedModels.value = checked
+              ? [...new Set([...selectedModels.value, id])]
+              : selectedModels.value.filter((item) => item !== id)
+          }
+
+          function toggleAllVisible(checked) {
+            const visible = new Set(filteredModels.value.map((item) => item.id))
+            selectedModels.value = checked
+              ? [...new Set([...selectedModels.value, ...visible])]
+              : selectedModels.value.filter((id) => !visible.has(id))
+          }
+
+          function modelDownloadUrl(row) {
+            return `/admin/api/models/download?model=${encodeURIComponent(row.id)}`
+          }
+
+          async function pullModel() {
+            const url = pullUrl.value.trim()
+            if (!url) {
+              pullError.value = '请填写模型下载地址'
+              return
+            }
+            try { new URL(url) } catch {
+              pullError.value = '模型下载地址格式不正确'
+              return
+            }
+            pulling.value = true
+            pullError.value = ''
+            pullMessage.value = ''
+            try {
+              const payload = await request('/admin/api/models/pull', {
+                method: 'POST',
+                body: JSON.stringify({ url, name: pullName.value.trim() || undefined }),
+              })
+              pullMessage.value = payload.linkWarning || `拉取完成：${payload.model.id}（链接已保存）`
+              pullUrl.value = ''
+              pullName.value = ''
+              if (payload.linkWarning) ElMessage.warning('模型已下载，但链接配置保存失败')
+              else ElMessage.success('模型拉取成功，链接已保存')
+              await loadStats()
+            } catch (error) {
+              pullError.value = `拉取失败：${error.message}`
+            } finally {
+              pulling.value = false
+            }
+          }
+
+          function resetLinkEditor() {
+            linkEditingId.value = null
+            linkForm.value = { id: '', url: '', enabled: true, sizeBytes: '', sha256: '' }
+          }
+
+          function openLinkEditor(row) {
+            linkEditingId.value = row?.id || null
+            linkForm.value = {
+              id: row?.id || '',
+              url: row?.url || '',
+              enabled: row?.enabled ?? true,
+              sizeBytes: row?.sizeBytes ? String(row.sizeBytes) : '',
+              sha256: row?.sha256 || '',
+            }
+            linkDialog.value = true
+          }
+
+          async function saveModelLink() {
+            const id = linkForm.value.id.trim()
+            const url = linkForm.value.url.trim()
+            if (!/\.gguf$/i.test(id)) {
+              ElMessage.warning('保存文件名必须以 .gguf 结尾')
+              return
+            }
+            if (/[\\/\u0000-\u001f\u007f<>:"|?*]/.test(id)) {
+              ElMessage.warning('保存文件名包含路径或非法字符')
+              return
+            }
+            try {
+              const target = new URL(url)
+              if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('invalid')
+            } catch {
+              ElMessage.warning('请填写不带账号密码的 HTTP/HTTPS 模型地址')
+              return
+            }
+            let sizeBytes = null
+            if (String(linkForm.value.sizeBytes).trim()) {
+              sizeBytes = Number(linkForm.value.sizeBytes)
+              if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+                ElMessage.warning('期望大小必须是正整数')
+                return
+              }
+            }
+            const sha256 = linkForm.value.sha256.trim() || null
+            if (sha256 && !/^[a-f0-9]{64}$/i.test(sha256)) {
+              ElMessage.warning('SHA-256 必须是 64 位十六进制字符串')
+              return
+            }
+            linkBusy.value = true
+            try {
+              const editingId = linkEditingId.value
+              await request(editingId ? `/admin/api/model-links/${encodeURIComponent(editingId)}` : '/admin/api/model-links', {
+                method: editingId ? 'PUT' : 'POST',
+                body: JSON.stringify({ id, url, enabled: linkForm.value.enabled, sizeBytes, sha256 }),
+              })
+              linkDialog.value = false
+              ElMessage.success(editingId ? '模型链接已更新' : '模型链接已新增')
+              await loadModelLinks()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              linkBusy.value = false
+            }
+          }
+
+          async function toggleModelLink(row, enabled) {
+            linkBusy.value = true
+            linkActionId.value = row.id
+            try {
+              await request(`/admin/api/model-links/${encodeURIComponent(row.id)}`, {
+                method: 'PUT',
+                body: JSON.stringify({ enabled }),
+              })
+              ElMessage.success(enabled ? '已启用差异拉取' : '已停用差异拉取')
+              await loadModelLinks()
+            } catch (error) {
+              ElMessage.error(error.message)
+              await loadModelLinks()
+            } finally {
+              linkBusy.value = false
+              linkActionId.value = ''
+            }
+          }
+
+          async function deleteModelLink(row) {
+            try {
+              await ElMessageBox.confirm(`确定删除 ${row.id} 的链接配置吗？本地模型文件不会被删除。`, '删除链接配置', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' })
+            } catch { return }
+            linkBusy.value = true
+            linkActionId.value = row.id
+            try {
+              await request(`/admin/api/model-links/${encodeURIComponent(row.id)}`, { method: 'DELETE' })
+              ElMessage.success('链接配置已删除')
+              await loadModelLinks()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              linkBusy.value = false
+              linkActionId.value = ''
+            }
+          }
+
+          async function pullMissingLinks() {
+            if (missingLinkCount.value === 0) {
+              ElMessage.info('没有启用且本地缺失的模型')
+              return
+            }
+            syncingLinks.value = true
+            syncMessage.value = ''
+            syncError.value = ''
+            try {
+              const payload = await request('/admin/api/model-links/pull-missing', { method: 'POST' })
+              const summary = payload.summary
+              syncMessage.value = `差异拉取完成：下载 ${summary.downloaded}，跳过 ${summary.skipped}，失败 ${summary.failed}`
+              const failures = (payload.results || []).filter((item) => ['failed', 'size_mismatch'].includes(item.status))
+              if (failures.length) {
+                syncError.value = failures.map((item) => `${item.id}：${item.message || '拉取失败'}`).join('；')
+                ElMessage.warning('部分模型需要处理')
+              } else {
+                ElMessage.success('缺失模型已补齐')
+              }
+              await loadStats()
+              await loadModelLinks()
+            } catch (error) {
+              syncError.value = `差异拉取失败：${error.message}`
+            } finally {
+              syncingLinks.value = false
+            }
+          }
+
+          function selectFile() {
+            fileInput.value?.click()
+          }
+
+          function uploadModel() {
+            const file = fileInput.value?.files?.[0]
+            if (!file) {
+              ElMessage.warning('请先选择一个 .gguf 文件')
+              return
+            }
+            if (!/\.gguf$/i.test(file.name)) {
+              uploadError.value = '仅支持 .gguf 模型文件'
+              return
+            }
+            const formData = new FormData()
+            formData.append('model', file)
+            const xhr = new XMLHttpRequest()
+            uploading.value = true
+            uploadPercent.value = 0
+            uploadError.value = ''
+            uploadMessage.value = ''
+            xhr.open('POST', '/admin/api/models/upload')
+            xhr.setRequestHeader('Authorization', `Bearer ${config.adminKey}`)
+            xhr.upload.addEventListener('progress', (event) => {
+              if (event.lengthComputable) uploadPercent.value = Math.round(event.loaded / event.total * 100)
+            })
+            xhr.addEventListener('load', async () => {
+              uploading.value = false
+              try {
+                const payload = JSON.parse(xhr.responseText)
+                if (xhr.status < 200 || xhr.status >= 300) throw new Error(payload.error?.message || `HTTP ${xhr.status}`)
+                uploadMessage.value = `上传完成：${payload.model.id}`
+                if (fileInput.value) fileInput.value.value = ''
+                ElMessage.success('模型上传成功')
+                await loadStats()
+              } catch (error) {
+                uploadError.value = `上传失败：${error.message}`
+              }
+            })
+            xhr.addEventListener('error', () => {
+              uploading.value = false
+              uploadError.value = '上传失败：网络连接中断'
+            })
+            xhr.addEventListener('abort', () => {
+              uploading.value = false
+              uploadMessage.value = '上传已取消'
+            })
+            xhr.send(formData)
+          }
+
+          async function modelAction(action, row) {
+            if (action === 'delete') {
+              try {
+                await ElMessageBox.confirm(`确定删除模型文件 ${row.id} 吗？此操作不可撤销。`, '删除模型', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' })
+              } catch { return }
+            }
+            if (action === 'unload') {
+              try {
+                await ElMessageBox.confirm(`确定卸载 ${row.id} 并立即回收内存吗？`, '卸载模型', { confirmButtonText: '确认卸载', cancelButtonText: '取消' })
+              } catch { return }
+            }
+            actionLoading.value = true
+            actionModel.value = row.id
+            try {
+              await request(`/admin/api/models/${action}`, { method: 'POST', body: JSON.stringify({ model: row.id }) })
+              ElMessage.success(action === 'load' ? '模型加载成功' : action === 'unload' ? '模型已卸载，内存已回收' : '模型已删除')
+              await loadStats()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              actionLoading.value = false
+              actionModel.value = ''
+            }
+          }
+
+          function openRename(row) {
+            renameModel.value = row
+            renameName.value = row.id
+            renameDialog.value = true
+          }
+
+          async function confirmRename() {
+            const name = renameName.value.trim()
+            if (!/\.gguf$/i.test(name)) {
+              ElMessage.warning('新文件名必须以 .gguf 结尾')
+              return
+            }
+            if (/[\\/\u0000-\u001f\u007f<>:"|?*]/.test(name)) {
+              ElMessage.warning('新文件名包含路径或非法字符')
+              return
+            }
+            renaming.value = true
+            try {
+              await request('/admin/api/models/rename', { method: 'POST', body: JSON.stringify({ model: renameModel.value.id, name }) })
+              renameDialog.value = false
+              ElMessage.success(`模型已重命名为 ${name}`)
+              await loadStats()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              renaming.value = false
+            }
+          }
+
+          function onResize() {
+            isMobile.value = window.innerWidth < 900
+            if (!isMobile.value) mobileOpen.value = false
+          }
+
+          function onHashChange() {
+            activePage.value = location.hash === '#models' ? 'models' : 'home'
+          }
+
+          onMounted(() => {
+            window.addEventListener('resize', onResize)
+            window.addEventListener('hashchange', onHashChange)
+            loadStats()
+            refreshTimer = setInterval(loadStats, 5000)
+          })
+
+          onBeforeUnmount(() => {
+            window.removeEventListener('resize', onResize)
+            window.removeEventListener('hashchange', onHashChange)
+            if (refreshTimer) clearInterval(refreshTimer)
+          })
+
+          return {
+            config, activePage, collapsed, isMobile, mobileOpen, menuCollapsed, stats, loading, loadError, lastUpdated,
+            modelSearch, fileInput, uploading, uploadPercent, uploadMessage, uploadError,
+            pullUrl, pullName, pulling, pullMessage, pullError, pullPercent,
+            modelLinks, modelLinksFile, linkLoading, modelLinksError, linkBusy, linkActionId,
+            syncingLinks, syncMessage, syncError, linkDialog, linkEditingId, linkForm,
+            enabledLinkCount, missingLinkCount, linkDialogTitle,
+            selectedModels, allVisibleSelected, someVisibleSelected, batchDownloadUrl,
+            concurrencyDraft, concurrencyDirty, concurrencyBusy, memoryPercent, diskPercent,
+            actionLoading, actionModel, usageBusy, renameDialog, renameName, renameModel, renaming,
+            pageTitle, pageSubtitle, filteredModels, apiUrl, modelsUrl, heartbeatText, heartbeatType,
+            formatCompact, formatBytes, formatUptime, formatDate, statusText, statusType,
+            linkLocalStatusText, linkLocalStatusType,
+            percentValue, formatPercent, pressureType, pressureColor, loadStats, loadModelLinks, navigate, toggleSidebar,
+            copyText, clearUsage, applyConcurrency, toggleModel, toggleAllVisible, modelDownloadUrl,
+            pullModel, openLinkEditor, resetLinkEditor, saveModelLink, toggleModelLink, deleteModelLink, pullMissingLinks,
+            selectFile, uploadModel, modelAction, openRename, confirmRename,
+          }
+        },
+      })
+
+      app.use(ElementPlus, { locale: window.ElementPlusLocaleZhCn })
+      app.mount('#app')
+    })()
+  </script>
+</body>
+</html>
