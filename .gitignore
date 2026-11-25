@@ -18,8 +18,6 @@ labeled_benchmark_results*.json
 *.db
 *.zip
 
-.env
-.env.*
 !.env.example
 .test-*
 .ui-test-*
