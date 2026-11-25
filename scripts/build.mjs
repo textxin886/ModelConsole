@@ -1,6 +1,7 @@
 
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -10,13 +11,35 @@ const archiveName = `rea-server-v${packageJson.version}.zip`
 const archivePath = path.join(outputDir, archiveName)
 const runtimeFiles = [
   'index.js',
+  'start.js',
   'workers/inference-worker.js',
-  'admin.html',
   'config/models.config.json',
   '.env',
+  '.npmrc',
   'package.json',
   'package-lock.json',
 ]
+
+// 先构建前端（产物输出到仓库根 web/），再打包运行文件 + web/ 全部资源
+const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+function runNpm(args) {
+  const result = spawnSync(`${npmCmd} ${args.join(' ')}`, { cwd: root, stdio: 'inherit', shell: true })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`npm ${args.join(' ')} 失败，退出码 ${result.status}`)
+}
+
+// --soft：postinstall 用，构建失败只警告不报错（start.js 启动时还会重试）
+const soft = process.argv.includes('--soft')
+
+async function listWeb(dir) {
+  const out = []
+  for (const item of await fs.readdir(path.join(root, dir), { withFileTypes: true })) {
+    const rel = `${dir}/${item.name}`
+    if (item.isDirectory()) out.push(...await listWeb(rel))
+    else out.push(rel)
+  }
+  return out
+}
 
 const crcTable = new Uint32Array(256)
 for (let index = 0; index < crcTable.length; index += 1) {
@@ -97,14 +120,29 @@ function createZip(entries) {
   return Buffer.concat([...localParts, centralDirectory, endRecord])
 }
 
-await fs.mkdir(outputDir, { recursive: true })
-const entries = await Promise.all(runtimeFiles.map(async (name) => ({
-  name,
-  data: await fs.readFile(path.join(root, name)),
-})))
-const archive = createZip(entries)
-await fs.writeFile(archivePath, archive)
+async function main() {
+  const frontendModules = await fs.stat(path.join(root, 'frontend', 'node_modules')).catch(() => null)
+  if (!frontendModules?.isDirectory()) runNpm(['--prefix', 'frontend', 'install'])
+  runNpm(['--prefix', 'frontend', 'run', 'build'])
 
-console.log(`已生成：${path.relative(root, archivePath)}`)
-console.log(`文件数：${entries.length}，大小：${archive.length} 字节`)
-console.log(`包含：${entries.map((entry) => entry.name).join(', ')}`)
+  await fs.mkdir(outputDir, { recursive: true })
+  const files = [...runtimeFiles, ...(await listWeb('web'))]
+  const entries = await Promise.all(files.map(async (name) => ({
+    name,
+    data: await fs.readFile(path.join(root, name)),
+  })))
+  const archive = createZip(entries)
+  await fs.writeFile(archivePath, archive)
+
+  console.log(`已生成：${path.relative(root, archivePath)}`)
+  console.log(`文件数：${entries.length}，大小：${archive.length} 字节`)
+  console.log(`包含：${entries.map((entry) => entry.name).join(', ')}`)
+}
+
+try {
+  await main()
+} catch (error) {
+  if (!soft) throw error
+  console.warn(`[build] 构建失败（postinstall 软模式忽略）：${error.message}`)
+  console.warn('[build] start.js 启动时会重试构建')
+}

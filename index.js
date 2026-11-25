@@ -39,7 +39,7 @@ const softLimitRatio = Number(process.env.MEMORY_SOFT_LIMIT_RATIO || 0.85)
 const hardLimitRatio = Number(process.env.MEMORY_HARD_LIMIT_RATIO || 0.95)
 const memoryMonitorIntervalMs = Number(process.env.MEMORY_CHECK_INTERVAL_MS || 1000)
 const allowPrivateModelUrls = process.env.MODEL_PULL_ALLOW_PRIVATE === 'true'
-const publicBaseUrl = (process.env.PUBLIC_BASE_URL || 'http://se1.nodaroo.fun:25682').replace(/\/+$/, '')
+const publicBaseUrl = (process.env.PUBLIC_BASE_URL || 'http://3.nodaroo.fun:26207').replace(/\/+$/, '')
 const apiKey = process.env.API_KEY || `sk-${crypto.randomBytes(24).toString('hex')}`
 const adminKey = process.env.ADMIN_KEY || apiKey
 const adminDownloadCookie = crypto.createHmac('sha256', adminKey).update('rea-admin-download-v1').digest('hex')
@@ -319,8 +319,11 @@ let idleTimer = null
 let heartbeatTimer = null
 let resourceTimer = null
 let uploadInProgress = false
-let pullInProgress = false
-let modelTransfer = null
+let uploadTransfer = null
+const transferTasks = []
+let activeTransfer = null
+const TRANSFER_IDLE_TIMEOUT_MS = 60000
+const TRANSFER_TASK_LIMIT = 50
 let hotModelIds = configuredHotModel ? new Set(configuredHotModel.split(',').map((s) => s.trim()).filter(Boolean)) : new Set()
 let hotModelPinned = Boolean(configuredHotModel) && hotModelIds.size > 0
 let shuttingDown = false
@@ -1404,11 +1407,48 @@ function handleAdminPage(req, res) {
   applyHeaders(res, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self'; img-src 'self' data:",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; img-src 'self' data:",
     'Set-Cookie': `rea_admin_download=${adminDownloadCookie}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=86400`,
   })
   res.writeHead(200)
   res.end(renderAdminHtml())
+}
+
+const webAssetTypes = {
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+}
+
+async function handleAdminAsset(req, res, pathname) {
+  const name = pathname.slice('/admin/assets/'.length)
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    throw new HttpError(400, '资源路径无效', 'invalid_value', 'path')
+  }
+  let data
+  try {
+    data = await fs.readFile(path.join(projectRoot, 'web', 'assets', name))
+  } catch {
+    throw new HttpError(404, '资源不存在', 'invalid_value', 'path')
+  }
+  applyHeaders(res, {
+    'Content-Type': webAssetTypes[path.extname(name).toLowerCase()] || 'application/octet-stream',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+  })
+  res.writeHead(200)
+  res.end(data)
 }
 
 async function readModelSelector(req) {
@@ -1898,9 +1938,117 @@ async function downloadModelToModelDir({ url, name, signal, expectedSizeBytes, e
   }
 }
 
+function taskSnapshot(task) {
+  const { controller, lastByteAt, abortRequested, abortReason, ...rest } = task
+  return rest
+}
+
+function activeTransferInfo() {
+  return activeTransfer ? taskSnapshot(activeTransfer) : null
+}
+
+function isTerminalTask(task) {
+  return ['done', 'failed', 'aborted'].includes(task.status)
+}
+
+function enqueueTransferTask({ kind, name, url, expectedSizeBytes, expectedSha256 }) {
+  const task = {
+    id: crypto.randomUUID(),
+    kind,
+    name: name || null,
+    url,
+    status: 'queued',
+    filename: name || null,
+    receivedBytes: 0,
+    totalBytes: 0,
+    sizeBytes: 0,
+    sha256: null,
+    error: null,
+    queuedAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    expectedSizeBytes: expectedSizeBytes || 0,
+    expectedSha256: expectedSha256 || null,
+    abortRequested: false,
+    abortReason: null,
+    controller: null,
+    lastByteAt: 0,
+  }
+  transferTasks.push(task)
+  while (transferTasks.length > TRANSFER_TASK_LIMIT) {
+    const dropIndex = transferTasks.findIndex(isTerminalTask)
+    if (dropIndex < 0) break
+    transferTasks.splice(dropIndex, 1)
+  }
+  pumpTransferTasks()
+  return task
+}
+
+function pumpTransferTasks() {
+  if (activeTransfer) return
+  const next = transferTasks.find((task) => task.status === 'queued')
+  if (!next) return
+  activeTransfer = next
+  next.controller = new AbortController()
+  next.lastByteAt = Date.now()
+  next.startedAt = new Date().toISOString()
+  runTransferTask(next).finally(() => {
+    activeTransfer = null
+    pumpTransferTasks()
+  })
+}
+
+async function runTransferTask(task) {
+  const watchdog = setInterval(() => {
+    if (Date.now() - task.lastByteAt > TRANSFER_IDLE_TIMEOUT_MS) {
+      task.abortRequested = true
+      task.abortReason = 'idle_timeout'
+      task.controller?.abort(new Error('下载超时：60 秒未收到数据'))
+    }
+  }, 5000)
+  try {
+    const pulled = await downloadModelToModelDir({
+      url: task.url,
+      name: task.name,
+      signal: task.controller.signal,
+      expectedSizeBytes: task.expectedSizeBytes,
+      expectedSha256: task.expectedSha256,
+      onProgress(progress) {
+        task.lastByteAt = Date.now()
+        Object.assign(task, progress)
+      },
+    })
+    task.filename = pulled.filename
+    task.sizeBytes = pulled.sizeBytes
+    task.sha256 = pulled.sha256
+    try {
+      await recordPulledModelLink({ id: pulled.filename, url: task.url, sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
+      task.linkSaved = true
+    } catch (error) {
+      task.linkSaved = false
+      task.linkWarning = `模型已下载，但链接配置保存失败：${error.message}`
+      console.error(task.linkWarning)
+    }
+    task.status = 'done'
+    console.log(`模型拉取完成：${pulled.filename}`)
+  } catch (error) {
+    if (task.abortRequested) {
+      task.status = 'aborted'
+      task.error = task.abortReason === 'idle_timeout' ? error.message : '已手动停止下载'
+    } else {
+      task.status = 'failed'
+      task.error = error instanceof HttpError ? error.message : `模型下载失败：${error.message}`
+    }
+    console.error(`模型拉取${task.status === 'aborted' ? '已停止' : '失败'}：${task.name || task.url}：${task.error}`)
+  } finally {
+    clearInterval(watchdog)
+    task.finishedAt = new Date().toISOString()
+  }
+}
+
 async function handleAdminPull(req, res) {
   requireAuth(req, adminKey)
-  if (uploadInProgress || pullInProgress) throw new HttpError(409, '已有模型正在传输，请稍后再试', 'transfer_in_progress')
+  if (uploadInProgress) throw new HttpError(409, '已有模型正在上传，请稍后再试', 'transfer_in_progress')
   const body = await readJson(req)
   if (!body || typeof body !== 'object' || typeof body.url !== 'string' || !body.url.trim()) {
     throw new HttpError(400, '请提供模型下载地址', 'invalid_url')
@@ -1909,101 +2057,31 @@ async function handleAdminPull(req, res) {
     throw new HttpError(400, 'name 必须是字符串', 'invalid_value', 'name')
   }
   const target = validateRemoteUrl(body.url.trim())
-  const controller = new AbortController()
-  req.once('aborted', () => controller.abort(new Error('客户端已断开')))
-  pullInProgress = true
-  modelTransfer = { type: 'pull', status: 'connecting', filename: body.name || null, receivedBytes: 0, totalBytes: 0 }
-  try {
-    const pulled = await downloadModelToModelDir({
-      url: target.toString(),
-      name: body.name,
-      signal: controller.signal,
-      onProgress(progress) {
-        modelTransfer = { ...modelTransfer, ...progress }
-        if (progress.receivedBytes !== undefined) modelTransfer.receivedBytes = progress.receivedBytes
-      },
-    })
-    let linkWarning = null
-    try {
-      await recordPulledModelLink({ id: pulled.filename, url: target.toString(), sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
-    } catch (error) {
-      linkWarning = `模型已下载，但链接配置保存失败：${error.message}`
-      console.error(linkWarning)
-    }
-    sendJson(res, 201, { ok: true, model: serializeModel(pulled.entry), linkSaved: !linkWarning, linkWarning })
-  } finally {
-    pullInProgress = false
-    modelTransfer = null
-  }
+  const task = enqueueTransferTask({ kind: 'pull', name: body.name, url: target.toString() })
+  sendJson(res, 202, { ok: true, task: taskSnapshot(task) })
 }
 
 async function handleAdminModelLinksPullMissing(req, res) {
   requireAuth(req, adminKey)
-  if (uploadInProgress || pullInProgress) throw new HttpError(409, '已有模型正在传输，请稍后再试', 'transfer_in_progress')
   const config = await readModelLinksConfig()
   const localModels = await scanModels()
-  const controller = new AbortController()
-  req.once('aborted', () => controller.abort(new Error('客户端已断开')))
-  pullInProgress = true
-  modelTransfer = { type: 'model-links-sync', status: 'preparing', filename: null, receivedBytes: 0, totalBytes: 0, syncIndex: 0, syncTotal: config.models.length }
-  const results = []
-  let downloaded = 0
-  let skipped = 0
-  let failed = 0
-  try {
-    for (let index = 0; index < config.models.length; index += 1) {
-      if (controller.signal.aborted) break
-      const link = config.models[index]
-      if (!link.enabled) {
-        results.push({ id: link.id, status: 'disabled' })
-        skipped += 1
-        continue
-      }
-      const local = findModelInList(localModels, link.id)
-      if (local) {
-        if (link.sizeBytes && local.sizeBytes !== link.sizeBytes) {
-          results.push({ id: link.id, status: 'size_mismatch', message: '本地文件大小与配置不一致，为避免覆盖已跳过' })
-          failed += 1
-        } else {
-          results.push({ id: link.id, status: 'exists' })
-          skipped += 1
-        }
-        continue
-      }
-      modelTransfer = { ...modelTransfer, syncIndex: index + 1, status: 'connecting', filename: link.id, receivedBytes: 0, totalBytes: 0 }
-      try {
-        const pulled = await downloadModelToModelDir({
-          url: link.url,
-          name: link.id,
-          signal: controller.signal,
-          expectedSizeBytes: link.sizeBytes,
-          expectedSha256: link.sha256,
-          onProgress(progress) {
-            modelTransfer = { ...modelTransfer, ...progress }
-            if (progress.receivedBytes !== undefined) modelTransfer.receivedBytes = progress.receivedBytes
-          },
-        })
-        await recordPulledModelLink({ id: pulled.filename, url: link.url, sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
-        results.push({ id: link.id, status: 'downloaded', sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
-        downloaded += 1
-      } catch (error) {
-        results.push({ id: link.id, status: 'failed', message: error.message })
-        failed += 1
-        if (controller.signal.aborted) break
-      }
+  const queued = []
+  const skipped = []
+  for (const link of config.models) {
+    if (!link.enabled) { skipped.push({ id: link.id, status: 'disabled' }); continue }
+    if (!link.url) { skipped.push({ id: link.id, status: 'no_url' }); continue }
+    const local = findModelInList(localModels, link.id)
+    if (local) {
+      if (link.sizeBytes && local.sizeBytes !== link.sizeBytes) { skipped.push({ id: link.id, status: 'size_mismatch' }); continue }
+      skipped.push({ id: link.id, status: 'exists' }); continue
     }
-    sendJson(res, 200, {
-      ok: failed === 0,
-      summary: { total: config.models.length, downloaded, skipped, failed },
-      results,
-      models: (await scanModels()).map(serializeModel),
-    })
-  } finally {
-    pullInProgress = false
-    modelTransfer = null
+    if (transferTasks.some((task) => !isTerminalTask(task) && String(task.name || '').toLowerCase() === link.id.toLowerCase())) {
+      skipped.push({ id: link.id, status: 'already_queued' }); continue
+    }
+    queued.push(taskSnapshot(enqueueTransferTask({ kind: 'link', name: link.id, url: link.url, expectedSizeBytes: link.sizeBytes, expectedSha256: link.sha256 })))
   }
+  sendJson(res, 202, { ok: true, queued: queued.length, skipped, tasks: queued })
 }
-
 async function handleAdminHotModelsUpdate(req, res) {
   requireAuth(req, adminKey)
   if (hotModelPinned) throw new HttpError(400, 'HOT_MODEL 环境变量已固定热启动模型，面板无法修改，请先清除环境变量', 'hot_model_pinned')
@@ -2031,41 +2109,54 @@ async function handleAdminHotModelsUpdate(req, res) {
 
 async function handleAdminModelLinkPullOne(req, res, id) {
   requireAuth(req, adminKey)
-  if (uploadInProgress || pullInProgress) throw new HttpError(409, '已有模型正在传输，请稍后再试', 'transfer_in_progress')
   const config = await readModelLinksConfig()
-  const link = config.models.find((entry) => entry.id === id)
-  if (!link) throw new HttpError(404, `模型链接不存在：${id}`, 'link_not_found')
-  if (!link.url) throw new HttpError(400, `模型链接缺少下载地址`, 'invalid_url')
+  const link = config.models.find((entry) => entry.id.toLowerCase() === id.toLowerCase())
+  if (!link) throw new HttpError(404, `模型链接不存在：${id}`, 'not_found', 'id')
+  if (!link.url) throw new HttpError(400, `模型链接缺少下载地址：${id}`, 'invalid_url', 'url')
   const localModels = await scanModels()
-  const local = findModelInList(localModels, id)
+  const local = findModelInList(localModels, link.id)
   if (local) {
-    if (link.sizeBytes && local.sizeBytes !== link.sizeBytes) {
-      throw new HttpError(409, '本地文件大小与配置不一致，为避免覆盖已跳过；请先手动删除再拉取', 'model_exists_size_mismatch')
+    if (link.sizeBytes && local.sizeBytes !== link.sizeBytes) throw new HttpError(409, `本地文件大小与配置不一致，请先手动删除再拉取：${id}`, 'model_size_mismatch', 'id')
+    throw new HttpError(409, `本地已存在该模型，如需重新拉取请先删除本地文件：${id}`, 'model_exists', 'id')
+  }
+  if (transferTasks.some((task) => !isTerminalTask(task) && String(task.name || '').toLowerCase() === id.toLowerCase())) {
+    throw new HttpError(409, `该模型已在下载队列中：${id}`, 'transfer_in_progress', 'id')
+  }
+  const task = enqueueTransferTask({ kind: 'link', name: link.id, url: link.url, expectedSizeBytes: link.sizeBytes, expectedSha256: link.sha256 })
+  sendJson(res, 202, { ok: true, task: taskSnapshot(task) })
+}
+async function handleAdminTransferAbort(req, res) {
+  requireAuth(req, adminKey)
+  const body = await readJson(req).catch(() => ({}))
+  if (body && typeof body.all !== 'boolean' && typeof body.taskId !== 'string') {
+    throw new HttpError(400, '请提供 all 或 taskId', 'invalid_value')
+  }
+  const all = body?.all === true
+  const taskId = typeof body?.taskId === 'string' ? body.taskId : null
+  let stopped = 0
+  for (const task of transferTasks) {
+    if (!(all || task.id === taskId)) continue
+    if (task.status === 'queued') {
+      task.status = 'aborted'
+      task.error = '已从队列移除'
+      task.finishedAt = new Date().toISOString()
+      stopped += 1
+    } else if (task === activeTransfer) {
+      task.abortRequested = true
+      task.abortReason = 'user'
+      task.controller?.abort(new Error('已手动停止下载'))
+      stopped += 1
     }
-    throw new HttpError(409, '本地已存在该模型，如需重新拉取请先删除本地文件', 'model_exists')
   }
-  const controller = new AbortController()
-  req.once('aborted', () => controller.abort(new Error('客户端已断开')))
-  pullInProgress = true
-  modelTransfer = { type: 'pull', status: 'connecting', filename: id, receivedBytes: 0, totalBytes: 0 }
-  try {
-    const pulled = await downloadModelToModelDir({
-      url: link.url,
-      name: id,
-      signal: controller.signal,
-      expectedSizeBytes: link.sizeBytes,
-      expectedSha256: link.sha256,
-      onProgress(progress) {
-        modelTransfer = { ...modelTransfer, ...progress }
-        if (progress.receivedBytes !== undefined) modelTransfer.receivedBytes = progress.receivedBytes
-      },
-    })
-    await recordPulledModelLink({ id: pulled.filename, url: link.url, sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
-    sendJson(res, 201, { ok: true, model: serializeModel(pulled.entry) })
-  } finally {
-    pullInProgress = false
-    modelTransfer = null
+  sendJson(res, 200, { ok: true, stopped, tasks: transferTasks.map(taskSnapshot) })
+}
+
+async function handleAdminTransferClear(req, res) {
+  requireAuth(req, adminKey)
+  for (let index = transferTasks.length - 1; index >= 0; index -= 1) {
+    if (isTerminalTask(transferTasks[index])) transferTasks.splice(index, 1)
   }
+  sendJson(res, 200, { ok: true, tasks: transferTasks.map(taskSnapshot) })
 }
 
 async function handleAdminUpload(req, res) {
@@ -2077,7 +2168,7 @@ async function handleAdminUpload(req, res) {
   if (!boundary || boundary.length > 200) throw new HttpError(400, '上传请求必须是 multipart/form-data', 'invalid_upload')
 
   uploadInProgress = true
-  modelTransfer = { type: 'upload', status: 'uploading', filename: null, receivedBytes: 0, totalBytes: 0 }
+  uploadTransfer = { type: 'upload', status: 'uploading', filename: null, receivedBytes: 0, totalBytes: 0 }
   const tempPath = path.join(modelDir, `.${crypto.randomUUID()}.part`)
   let targetPath = null
   let tempCreated = false
@@ -2117,9 +2208,9 @@ async function handleAdminUpload(req, res) {
           return
         }
         targetPath = path.join(modelDir, filename)
-        modelTransfer.filename = filename
+        uploadTransfer.filename = filename
         file.on('data', (chunk) => {
-          modelTransfer.receivedBytes += chunk.length
+          uploadTransfer.receivedBytes += chunk.length
         })
         if (fsSync.existsSync(targetPath)) {
           file.resume()
@@ -2179,7 +2270,7 @@ async function handleAdminUpload(req, res) {
       await new Promise((resolve) => writeStream.once('close', resolve))
     }
     if (tempCreated) await fs.rm(tempPath, { force: true }).catch(() => {})
-    modelTransfer = null
+    uploadTransfer = null
   }
 
   const uploaded = await resolveModel(path.basename(targetPath))
@@ -2432,7 +2523,11 @@ async function handleAdminStats(req, res) {
     hotModelIds: [...hotModelIds],
     hotModelPinned,
     system,
-    transfer: modelTransfer,
+    transfer: {
+      upload: uploadInProgress ? uploadTransfer : null,
+      active: activeTransferInfo(),
+      tasks: transferTasks.map(taskSnapshot),
+    },
     publicBaseUrl,
     uptimeSeconds: Math.floor(process.uptime()),
     queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, maxQueue },
@@ -2509,6 +2604,7 @@ async function route(req, res) {
   if (url.pathname === '/v1/models' && req.method === 'GET') return handleModels(req, res)
   if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return handleChat(req, res)
   if (url.pathname === '/admin' && req.method === 'GET') return handleAdminPage(req, res)
+  if (url.pathname.startsWith('/admin/assets/') && req.method === 'GET') return handleAdminAsset(req, res, url.pathname)
   if (url.pathname === '/admin/api/stats' && req.method === 'GET') return handleAdminStats(req, res)
   if (url.pathname === '/admin/api/model-links' && req.method === 'GET') return handleAdminModelLinks(req, res)
   if (url.pathname === '/admin/api/model-links' && req.method === 'POST') return handleAdminModelLinkCreate(req, res)
@@ -2556,6 +2652,8 @@ async function route(req, res) {
   }
   if (url.pathname === '/admin/api/models/upload' && req.method === 'POST') return handleAdminUpload(req, res)
   if (url.pathname === '/admin/api/models/pull' && req.method === 'POST') return handleAdminPull(req, res)
+  if (url.pathname === '/admin/api/transfer/abort' && req.method === 'POST') return handleAdminTransferAbort(req, res)
+  if (url.pathname === '/admin/api/transfer/clear' && req.method === 'POST') return handleAdminTransferClear(req, res)
   if (url.pathname === '/admin/api/models/download' && req.method === 'GET') return handleAdminDownload(req, res)
   if (url.pathname === '/admin/api/models/batch-download' && req.method === 'GET') return handleAdminBatchDownload(req, res)
   if (url.pathname === '/admin/api/models/load' && req.method === 'POST') return handleAdminLoad(req, res)
@@ -2597,7 +2695,11 @@ async function main() {
     console.error(`模型链接配置暂不可用：${error.message}`)
   }
   await fs.access(workerPath)
-  adminHtml = await fs.readFile(path.join(projectRoot, 'admin.html'), 'utf8')
+  try {
+    adminHtml = await fs.readFile(path.join(projectRoot, 'web', 'index.html'), 'utf8')
+  } catch {
+    throw new Error('缺少前端构建产物 web/index.html，请先执行 npm run build 再启动')
+  }
   startResourceMonitor()
   startMemoryMonitor()
   const models = await scanModels()

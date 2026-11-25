@@ -115,8 +115,9 @@ ZIP 最外层直接是 `index.js`，解压后不需要再进入额外文件夹�
 ```text
 index.js
 workers/inference-worker.js
-admin.html
 config/models.config.json
+web/index.html
+web/assets/*
 .env
 package.json
 package-lock.json
