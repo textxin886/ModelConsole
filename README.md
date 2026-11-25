@@ -106,11 +106,10 @@ npm run build
 产物位于：
 
 ```text
-dist/rea-server-v1.1.0.zip
-dist/rea-server-v1.1.0.zip.sha256
+dist/
 ```
 
-ZIP 最外层直接是 `index.js`，解压后不需要再进入额外文件夹。打包脚本只收录运行必需文件：
+`dist/` 即完整部署目录，最外层直接是 `index.js`，整体上传即可，无需解压或再进额外文件夹。打包脚本只收录运行必需文件：
 
 ```text
 index.js
