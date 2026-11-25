@@ -148,6 +148,29 @@
     .metric-label { color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
     .metric-value { margin-top: 9px; font-size: clamp(25px, 2.6vw, 32px); font-weight: 750; letter-spacing: -.035em; overflow-wrap: anywhere; }
     .metric-foot { margin-top: 8px; color: var(--muted); font-size: 12px; }
+
+    .log-viewer {
+      background: #0d1117;
+      color: #c9d1d9;
+      border-radius: 6px;
+      padding: 10px 12px;
+      height: 360px;
+      overflow: auto;
+      font-family: 'Cascadia Mono', 'Consolas', 'JetBrains Mono', 'Menlo', monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-empty { color: #8b949e; text-align: center; padding: 40px 0; }
+    .log-line { display: flex; gap: 8px; }
+    .log-time { color: #8b949e; flex-shrink: 0; font-size: 11px; }
+    .log-level { flex-shrink: 0; font-size: 11px; font-weight: 600; width: 52px; text-align: center; border-radius: 3px; padding: 1px 4px; }
+    .log-info .log-level { background: #1f6feb33; color: #58a6ff; }
+    .log-warn .log-level { background: #d2992233; color: #d29922; }
+    .log-error .log-level { background: #f8514933; color: #f85149; }
+    .log-text { flex: 1; }
+    .panel-actions { display: flex; align-items: center; gap: 8px; }
     .panel { flex: 1 1 380px; min-width: 0; }
     .panel.full { flex: 1 1 100%; }
     .panel .el-card__body { padding: 18px; }
@@ -289,7 +312,8 @@
           <div class="topbar-actions">
             <el-tag v-if="stats.queue.queued > 0" type="warning" effect="plain">排队 {{ stats.queue.queued }}</el-tag>
             <el-tag :type="heartbeatType" effect="plain">{{ heartbeatText }}</el-tag>
-            <el-button :loading="loading" @click="loadStats">刷新</el-button>
+            <span v-if="lastUpdated" class="metric-foot" style="margin: 0 4px;">上次更新 {{ formatDate(lastUpdated) }}</span>
+            <el-button :loading="loading || linkLoading" @click="refreshAll">立即刷新</el-button>
           </div>
         </header>
 
@@ -341,10 +365,19 @@
               <el-card class="resource-card" shadow="hover">
                 <div class="panel-heading">
                   <div><h2>内存</h2><p>系统与推理进程占用</p></div>
-                  <el-tag :type="pressureType(memoryPercent)" effect="plain">{{ formatPercent(memoryPercent) }}</el-tag>
+                  <div style="display: flex; gap: 6px; align-items: center;">
+                    <el-tag v-if="stats.memoryPressure === 'hard'" type="danger" effect="dark" size="small">硬阈值 · 拒绝新请求</el-tag>
+                    <el-tag v-else-if="stats.memoryPressure === 'soft'" type="warning" effect="dark" size="small">软阈值 · 自动降级中</el-tag>
+                    <el-tag v-else type="success" effect="plain" size="small">健康</el-tag>
+                    <el-tag :type="pressureType(memoryPercent)" effect="plain">{{ formatPercent(memoryPercent) }}</el-tag>
+                  </div>
                 </div>
                 <div class="resource-value">{{ formatBytes(stats.system?.memory?.usedBytes) }} <span class="metric-foot">/ {{ formatBytes(stats.system?.memory?.totalBytes) }}</span></div>
                 <el-progress :percentage="percentValue(memoryPercent)" :color="pressureColor(memoryPercent)" :stroke-width="9"></el-progress>
+                <div v-if="stats.memoryThresholds" class="metric-foot">
+                  软限 {{ formatBytes(stats.memoryThresholds.softBytes) }} · 硬限 {{ formatBytes(stats.memoryThresholds.hardBytes) }}
+                  <template v-if="stats.memoryPressureAt"> · 上次切换 {{ formatDate(stats.memoryPressureAt) }}</template>
+                </div>
                 <div class="metric-foot">Node {{ formatBytes(stats.serverRssBytes) }} · 推理 {{ formatBytes(stats.system?.memory?.runtimeBytes) }} · 可用 {{ formatBytes(stats.system?.memory?.freeBytes) }}</div>
               </el-card>
 
@@ -367,13 +400,19 @@
                 </div>
                 <el-descriptions :column="2" border>
                   <el-descriptions-item label="当前模型" :span="2"><span class="description-value">{{ stats.runtime?.id || '未加载' }}</span></el-descriptions-item>
-                  <el-descriptions-item label="热启动模型" :span="2"><span class="description-value">{{ stats.hotModelId || '未选择' }}</span><el-tag v-if="stats.hotModelPinned" size="small" type="warning" effect="plain">HOT_MODEL 固定</el-tag></el-descriptions-item>
+                  <el-descriptions-item label="热启动模型" :span="2">
+                    <span v-if="(stats.hotModelIds || []).length === 0" class="description-value">未选择（全部模型按闲置回收）</span>
+                    <span v-else class="description-value">
+                      <el-tag v-for="id in stats.hotModelIds" :key="id" size="small" type="warning" effect="dark" style="margin: 2px 6px 2px 0;">{{ id }}</el-tag>
+                    </span>
+                    <el-tag v-if="stats.hotModelPinned" size="small" type="warning" effect="plain" style="margin-left: 6px;">HOT_MODEL 固定</el-tag>
+                  </el-descriptions-item>
                   <el-descriptions-item label="总 RSS">{{ formatBytes(stats.runtime?.rssBytes ?? stats.serverRssBytes) }}</el-descriptions-item>
                   <el-descriptions-item label="上下文大小">{{ stats.runtime?.contextSize ? formatCompact(stats.runtime.contextSize) : '—' }}</el-descriptions-item>
                   <el-descriptions-item label="模型内存">{{ stats.runtime ? formatBytes(stats.runtime.modelBytes) : '—' }}</el-descriptions-item>
                   <el-descriptions-item label="上下文内存">{{ stats.runtime ? formatBytes(stats.runtime.contextMemory?.ram || 0) : '—' }}</el-descriptions-item>
                   <el-descriptions-item label="闲置回收">{{ Math.round(stats.modelIdleTimeoutMs / 1000) }} 秒</el-descriptions-item>
-                  <el-descriptions-item label="内存上限">{{ formatBytes(stats.memoryLimitBytes) }}</el-descriptions-item>
+                  <el-descriptions-item label="内存上限">{{ formatBytes(stats.memoryLimitBytes) }}<template v-if="stats.memoryThresholds"> · 软限 {{ formatBytes(stats.memoryThresholds.softBytes) }} · 硬限 {{ formatBytes(stats.memoryThresholds.hardBytes) }}</template></el-descriptions-item>
                   <el-descriptions-item label="推理实例">{{ stats.runtime?.instanceCount || 0 }} 个</el-descriptions-item>
                   <el-descriptions-item label="队列状态">活跃 {{ stats.queue.active }} · 排队 {{ stats.queue.queued }}</el-descriptions-item>
                 </el-descriptions>
@@ -435,9 +474,9 @@
               </el-card>
 
               <el-card class="panel full" shadow="hover">
-                <div class="panel-heading"><div><h2>近期请求</h2><p>仅记录 token、耗时和状态，不保存请求正文</p></div></div>
+                <div class="panel-heading"><div><h2>近期请求</h2><p>最多保留 {{ MAX_RECENT_REQUESTS }} 条，每页 20 条；仅记录 token、耗时和状态，不保存请求正文</p></div></div>
                 <div class="table-shell">
-                  <el-table class="usage-table" :data="stats.recent" size="small" empty-text="暂无请求记录">
+                  <el-table class="usage-table" :data="pagedRecent" size="small" empty-text="暂无请求记录">
                     <el-table-column label="时间" min-width="165"><template #default="{ row }">{{ formatDate(row.timestamp) }}</template></el-table-column>
                     <el-table-column label="模型" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ row.model || '—' }}</template></el-table-column>
                     <el-table-column label="状态" min-width="90"><template #default="{ row }"><el-tag size="small" :type="row.status === 'success' ? 'success' : 'danger'">{{ row.status === 'success' ? '成功' : '失败' }}</el-tag></template></el-table-column>
@@ -447,7 +486,36 @@
                     <el-table-column label="耗时" min-width="100" align="right"><template #default="{ row }">{{ formatCompact(row.latencyMs) }} ms</template></el-table-column>
                     <el-table-column label="结束原因" min-width="130"><template #default="{ row }">{{ row.status === 'success' ? (row.finishReason || 'stop') : (row.errorCode || 'error') }}</template></el-table-column>
                   </el-table>
+                  <div style="display: flex; justify-content: flex-end; margin-top: 8px;">
+                    <el-pagination v-model:current-page="recentPage" :page-size="20" :total="(stats.recent || []).length" layout="prev, pager, next, total" />
+                  </div>
                 </div>
+              </el-card>
+
+              <el-card class="panel full" shadow="hover">
+                <div class="panel-heading">
+                  <div><h2>服务日志</h2><p>主进程与推理 worker 的控制台输出，自动按天滚分到 logs/ 目录；超过 20MB 或 14 天自动清理</p></div>
+                  <div class="panel-actions">
+                    <el-radio-group v-model="logStream" size="small">
+                      <el-radio-button value="server">主进程</el-radio-button>
+                      <el-radio-button value="worker">推理 Worker</el-radio-button>
+                    </el-radio-group>
+                    <el-button size="small" :loading="logLoading" @click="refreshLog">刷新</el-button>
+                    <el-button size="small" type="danger" plain @click="openLogCleanup">清理日志</el-button>
+                  </div>
+                </div>
+                <div class="log-viewer" ref="logViewerRef">
+                  <div v-if="logLoading && logLines.length === 0" class="log-empty">加载中…</div>
+                  <div v-else-if="logLines.length === 0" class="log-empty">暂无日志</div>
+                  <template v-else>
+                    <div v-for="(line, index) in logLines" :key="index" class="log-line" :class="`log-${line.level}`">
+                      <span class="log-time">{{ formatDate(line.t) }}</span>
+                      <span class="log-level">{{ line.level.toUpperCase() }}</span>
+                      <span class="log-text">{{ line.text }}</span>
+                    </div>
+                  </template>
+                </div>
+                <div class="metric-foot" style="margin-top: 4px;">共 {{ logLines.length }} 行 · 磁盘文件：{{ logFile || '-*-.log' }}</div>
               </el-card>
             </section>
           </template>
@@ -512,9 +580,10 @@
                       <template #default="{ row }"><el-tag size="small" :type="linkLocalStatusType(row.localStatus)">{{ linkLocalStatusText(row.localStatus) }}</el-tag><div v-if="row.localStatus === 'size_mismatch'" class="metric-foot">本地 {{ formatBytes(row.localSizeBytes) }}</div></template>
                     </el-table-column>
                     <el-table-column label="最近拉取" min-width="165"><template #default="{ row }">{{ formatDate(row.lastPulledAt) }}</template></el-table-column>
-                    <el-table-column label="操作" min-width="165" fixed="right">
+                    <el-table-column label="操作" min-width="230" fixed="right">
                       <template #default="{ row }">
                         <div class="row-actions">
+                          <el-button size="small" type="success" :loading="pullingLink === row.id" :disabled="linkBusy || syncingLinks || pullingLink || row.localStatus === 'present'" @click="pullSingleLink(row.id)">拉取</el-button>
                           <el-button size="small" :disabled="linkBusy || syncingLinks" @click="openLinkEditor(row)">编辑</el-button>
                           <el-button size="small" type="danger" plain :disabled="linkBusy || syncingLinks" @click="deleteModelLink(row)">删除</el-button>
                         </div>
@@ -561,11 +630,12 @@
                     <el-table-column label="创建时间" min-width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
                     <el-table-column label="最近使用" min-width="170"><template #default="{ row }">{{ row.lastUsedAt ? formatDate(row.lastUsedAt) : '—' }}</template></el-table-column>
                     <el-table-column label="上下文" min-width="100" align="right"><template #default="{ row }">{{ row.contextSize ? formatCompact(row.contextSize) : '—' }}</template></el-table-column>
-                    <el-table-column label="操作" min-width="430" fixed="right">
+                    <el-table-column label="操作" min-width="500" fixed="right">
                       <template #default="{ row }">
                         <div class="row-actions">
                           <a :href="modelDownloadUrl(row)" title="下载模型"><el-button size="small">下载</el-button></a>
-                          <el-button size="small" :type="row.status === 'unloaded' ? 'primary' : 'warning'" plain :loading="actionModel === row.id" :disabled="row.isHot || (actionLoading && actionModel !== row.id)" @click="modelAction(row.status === 'unloaded' ? 'load' : 'unload', row)">{{ row.isHot ? '热启动常驻' : (row.status === 'unloaded' ? '加载' : '卸载') }}</el-button>
+                          <el-button size="small" :type="row.status === 'unloaded' ? 'primary' : 'warning'" plain :loading="actionModel === row.id" :disabled="(hotModelLoading || actionLoading) && actionModel !== row.id" @click="modelAction(row.status === 'unloaded' ? 'load' : 'unload', row)">{{ row.status === 'unloaded' ? '加载' : '卸载' }}</el-button>
+                          <el-button size="small" :type="row.isHot ? 'warning' : 'default'" :disabled="stats.hotModelPinned || hotModelLoading" :loading="hotModelLoading" @click="toggleHotModel(row.id)">{{ row.isHot ? '取消热启动' : '设为热启动' }}</el-button>
                           <el-button size="small" :disabled="row.status === 'loading' || actionLoading" @click="openRename(row)">重命名</el-button>
                           <el-button size="small" type="danger" plain :disabled="row.status === 'loading' || actionLoading" @click="modelAction('delete', row)">删除</el-button>
                         </div>
@@ -642,7 +712,7 @@
         return
       }
 
-      const { createApp, ref, computed, onMounted, onBeforeUnmount } = Vue
+      const { createApp, ref, computed, onMounted, onBeforeUnmount, watch, nextTick } = Vue
       const { ElMessage, ElMessageBox } = ElementPlus
       const config = JSON.parse(document.getElementById('runtime-config').textContent)
       const number = new Intl.NumberFormat('zh-CN')
@@ -720,6 +790,16 @@
           const renameModel = ref(null)
           const renaming = ref(false)
           let refreshTimer = null
+          const hotModelLoading = ref(false)
+          const pullingLink = ref('')
+          const linkPullError = ref('')
+          const recentPage = ref(1)
+          const MAX_RECENT_REQUESTS = 500
+          const logStream = ref('server')
+          const logLines = ref([])
+          const logFile = ref('')
+          const logLoading = ref(false)
+          const logViewerRef = ref(null)
 
           try { collapsed.value = localStorage.getItem('rea-sidebar-collapsed') === 'true' } catch {}
 
@@ -754,6 +834,11 @@
             if (!transfer || !['pull', 'model-links-sync'].includes(transfer.type)) return 0
             if (transfer.totalBytes > 0) return Math.min(100, Math.round(transfer.receivedBytes / transfer.totalBytes * 100))
             return 0
+          })
+          const pagedRecent = computed(() => {
+            const list = stats.value.recent || []
+            const start = Math.max(0, (recentPage.value - 1) * 20)
+            return list.slice(start, start + 20)
           })
           const apiUrl = computed(() => `${stats.value.publicBaseUrl}/v1/chat/completions`)
           const modelsUrl = computed(() => `${stats.value.publicBaseUrl}/v1/models`)
@@ -839,13 +924,73 @@
               if (!concurrencyBusy.value && !concurrencyDirty.value) concurrencyDraft.value = stats.value.queue.maxActive
               lastUpdated.value = new Date().toISOString()
               loadError.value = ''
-              loadModelLinks()
             } catch (error) {
               loadError.value = `加载失败：${error.message}`
             } finally {
               loading.value = false
             }
           }
+
+          async function refreshAll() {
+            await Promise.all([loadStats(), loadModelLinks(), refreshLog()])
+          }
+
+          async function refreshLog() {
+            try {
+              logLoading.value = true
+              const data = await request(`/admin/api/logs?stream=${logStream.value}&n=100`)
+              logLines.value = data.lines || []
+              logFile.value = data.file || ''
+              await nextTick()
+              if (logViewerRef.value) logViewerRef.value.scrollTop = logViewerRef.value.scrollHeight
+            } catch (error) {
+              logLines.value = []
+              logFile.value = ''
+            } finally {
+              logLoading.value = false
+            }
+          }
+
+          async function openLogCleanup() {
+            try {
+              const { value } = await ElMessageBox.confirm(
+                '<p>选择清理策略：</p>' +
+                '<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;">' +
+                '<label><input type="radio" name="lc" value="auto" checked> 自动（清理超过 14 天或超过 50 个文件的旧日志）</label>' +
+                '<label><input type="radio" name="lc" value="age"> 按天数清理（保留最近 <input id="lc-days" size="3" value="7" style="width:48px"> 天）</label>' +
+                '<label><input type="radio" name="lc" value="count"> 按数量清理（保留最近 <input id="lc-count" size="4" value="20" style="width:56px"> 个文件）</label>' +
+                '<label><input type="radio" name="lc" value="all" style="color:#f56c6c"> <b>全部清空</b>（logs 目录下所有 .log 文件，不可恢复）</label>' +
+                '</div>',
+                '清理日志文件',
+                {
+                  dangerouslyUseHTMLString: true,
+                  confirmButtonText: '执行清理',
+                  cancelButtonText: '取消',
+                  type: 'warning',
+                  distinguishCancelAndClose: true,
+                }
+              )
+              // 用户选完时读 radio + 数字 input
+              const radio = document.querySelector('input[name="lc"]:checked')
+              const mode = radio ? radio.value : 'auto'
+              const days = Number(document.getElementById('lc-days')?.value) || 7
+              const totalFiles = Number(document.getElementById('lc-count')?.value) || 20
+              if (mode === 'all') {
+                await ElMessageBox.confirm('确认要清空 logs/ 目录下所有日志文件吗？此操作不可撤销。', '全部清空', { type: 'error', confirmButtonText: '确认清空', cancelButtonText: '取消' })
+              }
+              const payload = { mode }
+              if (mode === 'age') payload.days = days
+              if (mode === 'count') payload.totalFiles = totalFiles
+              const result = await request('/admin/api/logs', { method: 'POST', body: JSON.stringify(payload) })
+              ElMessage.success(`清理完成：扫描 ${result.scanned} 个文件，删除 ${result.deleted} 个，释放 ${formatBytes(result.freedBytes)}`)
+              await refreshLog()
+            } catch (error) {
+              if (error === 'cancel' || error === 'close') return
+              ElMessage.error(error.message)
+            }
+          }
+
+          watch(logStream, () => refreshLog())
 
           async function loadModelLinks() {
             if (linkLoading.value) return
@@ -1181,6 +1326,42 @@
             }
           }
 
+          async function toggleHotModel(id) {
+            try {
+              const current = new Set(stats.value.hotModelIds || [])
+              if (current.has(id)) current.delete(id)
+              else current.add(id)
+              hotModelLoading.value = true
+              const payload = await request('/admin/api/hot-models', {
+                method: 'POST',
+                body: JSON.stringify({ modelIds: [...current] }),
+              })
+              stats.value.hotModelIds = payload.hotModelIds
+              ElMessage.success(payload.hotModelIds.length === 0 ? '已清除全部热启动模型' : `热启动模型已更新：${payload.hotModelIds.length} 个`)
+              await loadStats()
+            } catch (error) {
+              ElMessage.error(error.message)
+            } finally {
+              hotModelLoading.value = false
+            }
+          }
+
+          async function pullSingleLink(id) {
+            try {
+              pullingLink.value = id
+              linkPullError.value = ''
+              const payload = await request(`/admin/api/model-links/${encodeURIComponent(id)}/pull`, { method: 'POST' })
+              ElMessage.success(`模型已拉取：${payload.model.id}`)
+              await loadStats()
+              await loadModelLinks()
+            } catch (error) {
+              linkPullError.value = `${id}：${error.message}`
+              ElMessage.error(error.message)
+            } finally {
+              pullingLink.value = ''
+            }
+          }
+
           function openRename(row) {
             renameModel.value = row
             renameName.value = row.id
@@ -1222,8 +1403,14 @@
           onMounted(() => {
             window.addEventListener('resize', onResize)
             window.addEventListener('hashchange', onHashChange)
-            loadStats()
-            refreshTimer = setInterval(loadStats, 5000)
+            refreshAll()
+            // 有拉取/上传活动时，每 2 秒刷一次 stats 显示进度；空闲时不自动轮询
+            refreshTimer = setInterval(() => {
+              const transfer = stats.value?.transfer
+              const active = pulling.value || syncingLinks.value || uploading.value
+                || (transfer && ['pull', 'upload', 'model-links-sync'].includes(transfer.type))
+              if (active) loadStats().catch(() => {})
+            }, 2000)
           })
 
           onBeforeUnmount(() => {
@@ -1242,13 +1429,15 @@
             selectedModels, allVisibleSelected, someVisibleSelected, batchDownloadUrl,
             concurrencyDraft, concurrencyDirty, concurrencyBusy, memoryPercent, diskPercent,
             actionLoading, actionModel, usageBusy, renameDialog, renameName, renameModel, renaming,
+            hotModelLoading, pullingLink, linkPullError, recentPage, pagedRecent, MAX_RECENT_REQUESTS,
+            logStream, logLines, logFile, logLoading, logViewerRef, refreshLog, openLogCleanup,
             pageTitle, pageSubtitle, filteredModels, apiUrl, modelsUrl, heartbeatText, heartbeatType,
             formatCompact, formatBytes, formatUptime, formatDate, statusText, statusType,
             linkLocalStatusText, linkLocalStatusType,
-            percentValue, formatPercent, pressureType, pressureColor, loadStats, loadModelLinks, navigate, toggleSidebar,
+            percentValue, formatPercent, pressureType, pressureColor, loadStats, loadModelLinks, refreshAll, navigate, toggleSidebar,
             copyText, clearUsage, applyConcurrency, toggleModel, toggleAllVisible, modelDownloadUrl,
             pullModel, openLinkEditor, resetLinkEditor, saveModelLink, toggleModelLink, deleteModelLink, pullMissingLinks,
-            selectFile, uploadModel, modelAction, openRename, confirmRename,
+            selectFile, uploadModel, modelAction, openRename, confirmRename, toggleHotModel, pullSingleLink,
           }
         },
       })

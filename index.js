@@ -15,6 +15,7 @@ const { pipeline } = require('node:stream/promises')
 const Busboy = require('busboy')
 
 const projectRoot = __dirname
+const logDir = path.join(projectRoot, 'logs')
 const port = Number(process.env.PORT || 25682)
 const host = process.env.HOST || '0.0.0.0'
 const threads = Number(process.env.THREADS || 2)
@@ -31,8 +32,12 @@ let configuredHotModel = (process.env.HOT_MODEL || '').trim()
 const modelIdleTimeoutMs = Number(process.env.MODEL_IDLE_TIMEOUT_MS || 300000)
 const modelLoadTimeoutMs = Number(process.env.MODEL_LOAD_TIMEOUT_MS || 300000)
 const maxModelBytes = Number(process.env.MAX_MODEL_BYTES || 20 * 1024 ** 3)
-const modelMemoryOverheadMb = Number(process.env.MODEL_MEMORY_OVERHEAD_MB || 1536)
+const modelMemoryOverheadMb = Number(process.env.MODEL_MEMORY_OVERHEAD_MB || 0)
 const memoryLimitMb = Number(process.env.MEMORY_LIMIT_MB || 0)
+const memoryOverheadBaseMb = Number(process.env.MEMORY_OVERHEAD_BASE_MB || 512)
+const softLimitRatio = Number(process.env.MEMORY_SOFT_LIMIT_RATIO || 0.85)
+const hardLimitRatio = Number(process.env.MEMORY_HARD_LIMIT_RATIO || 0.95)
+const memoryMonitorIntervalMs = Number(process.env.MEMORY_CHECK_INTERVAL_MS || 1000)
 const allowPrivateModelUrls = process.env.MODEL_PULL_ALLOW_PRIVATE === 'true'
 const publicBaseUrl = (process.env.PUBLIC_BASE_URL || 'http://se1.nodaroo.fun:25682').replace(/\/+$/, '')
 const apiKey = process.env.API_KEY || `sk-${crypto.randomBytes(24).toString('hex')}`
@@ -41,41 +46,23 @@ const adminDownloadCookie = crypto.createHmac('sha256', adminKey).update('rea-ad
 const usageFile = path.join(projectRoot, 'usage.json')
 const modelLinksFile = path.resolve(process.env.MODEL_LINKS_FILE || path.join(projectRoot, 'config', 'models.config.json'))
 const workerPath = path.join(projectRoot, 'workers', 'inference-worker.js')
-const defaultModelLinks = [
-  {
-    id: 'Qwen3.5-0.8B-Q4_K_M.gguf',
-    url: 'https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf?download=true',
-    enabled: true,
-    sizeBytes: 532517120,
-    sha256: 'bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517',
-  },
-  {
-    id: 'Qwen3.5-2B-Q4_K_M.gguf',
-    url: 'https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf?download=true',
-    enabled: true,
-    sizeBytes: 1280835840,
-    sha256: 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223',
-  },
-  {
-    id: 'Qwen3-4B-Instruct-2507-Q6_K.gguf',
-    url: 'https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q6_K.gguf?download=true',
-    enabled: true,
-    sizeBytes: 3306261600,
-    sha256: 'cd7b21b38b3e71400587c184b6a9b04d3beb4d13fdae6464d4075dee4f1bc5ad',
-  },
-]
 const defaultSystemPrompt = '你是一个乐于助人的中文助手。回答简洁、准确。'
 const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED !== 'false'
 const keepAliveIntervalMs = Number(process.env.KEEP_ALIVE_INTERVAL_MS || 300000)
 const keepAliveUrl = process.env.KEEP_ALIVE_URL || `${publicBaseUrl}/health`
 
-for (const [name, value] of Object.entries({ port, threads, contextSize, maxQueue, requestTimeoutMs, maxBodyBytes, modelIdleTimeoutMs, modelLoadTimeoutMs, maxModelBytes, modelMemoryOverheadMb, keepAliveIntervalMs })) {
+for (const [name, value] of Object.entries({ port, threads, contextSize, maxQueue, requestTimeoutMs, maxBodyBytes, modelIdleTimeoutMs, modelLoadTimeoutMs, maxModelBytes, keepAliveIntervalMs })) {
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} 必须是正整数`)
 }
 if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > maxConcurrencyLimit) {
   throw new Error(`MAX_CONCURRENCY 必须是 1–${maxConcurrencyLimit} 的整数`)
 }
 if (!Number.isInteger(memoryLimitMb) || memoryLimitMb < 0) throw new Error('MEMORY_LIMIT_MB 必须是非负整数')
+if (!Number.isInteger(modelMemoryOverheadMb) || modelMemoryOverheadMb < 0) throw new Error('MODEL_MEMORY_OVERHEAD_MB 必须是非负整数（0 表示动态估算）')
+if (!Number.isInteger(memoryOverheadBaseMb) || memoryOverheadBaseMb < 0) throw new Error('MEMORY_OVERHEAD_BASE_MB 必须是非负整数')
+if (!(softLimitRatio > 0 && softLimitRatio < 1)) throw new Error('MEMORY_SOFT_LIMIT_RATIO 必须在 (0, 1) 区间')
+if (!(hardLimitRatio > 0 && hardLimitRatio <= 1)) throw new Error('MEMORY_HARD_LIMIT_RATIO 必须在 (0, 1] 区间')
+if (!(hardLimitRatio > softLimitRatio)) throw new Error('MEMORY_HARD_LIMIT_RATIO 必须大于 MEMORY_SOFT_LIMIT_RATIO')
 
 class HttpError extends Error {
   constructor(status, message, code, param) {
@@ -84,6 +71,201 @@ class HttpError extends Error {
     this.code = code
     this.param = param
   }
+}
+
+// --- 日志系统：落盘到 logs/ + 内存环形缓冲给 admin 页读 ---
+const LOG_RING_LINES = 500        // 内存里每路最多留 500 行给前端取
+const LOG_FLUSH_MS = 250          // 异步批量写盘间隔
+const LOG_MAX_BYTES_PER_FILE = 20 * 1024 * 1024   // 单文件超过 20MB 滚分
+const LOG_MAX_AGE_DAYS = 14                     // 自动清理 14 天前的文件
+const LOG_MAX_TOTAL_FILES = 50                  // 兜底：最多保留 50 个文件，超了就按时间删
+let logServerRing = []
+let logWorkerRing = []
+let logFileStream = null       // 当前天的 server.log 写流
+let logWorkerStream = null
+let logFlushTimer = null
+let logFlushQueue = Promise.resolve()
+let currentLogDate = ''
+let logServerFileSize = 0
+let logWorkerFileSize = 0
+let logRotatedServerIndex = 0  // 当天 server 已滚了几次
+let logRotatedWorkerIndex = 0  // 当天 worker 已滚了几次
+
+function logLine(stream, level, text) {
+  const ring = stream === 'worker' ? logWorkerRing : logServerRing
+  const line = { t: Date.now(), level, text }
+  ring.push(line)
+  if (ring.length > LOG_RING_LINES) ring.splice(0, ring.length - LOG_RING_LINES)
+  scheduleLogFlush()
+}
+
+function scheduleLogFlush() {
+  if (logFlushTimer) return
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = null
+    flushLogs()
+  }, LOG_FLUSH_MS)
+}
+
+function logFileName(stream, dateStr, seq = 0) {
+  const base = path.join(logDir, `${stream}-${dateStr}`)
+  return seq > 0 ? `${base}-${seq}.log` : `${base}.log`
+}
+
+async function ensureLogStream(stream) {
+  if (!fsSync.existsSync(logDir)) await fs.mkdir(logDir, { recursive: true })
+  const dateStr = new Date().toISOString().slice(0, 10)
+  if (stream === 'server') {
+    // 换天了 → 重置序号、关旧流、开新文件
+    if (currentLogDate !== dateStr || !logFileStream || logServerFileSize >= LOG_MAX_BYTES_PER_FILE) {
+      try { logFileStream.end() } catch {}
+      if (currentLogDate !== dateStr) { logRotatedServerIndex = 0; logServerFileSize = 0 }
+      else logRotatedServerIndex += 1
+      logFileStream = fsSync.createWriteStream(logFileName('server', dateStr, logRotatedServerIndex), { flags: 'a', encoding: 'utf8' })
+      currentLogDate = dateStr
+    }
+    return { stream: logFileStream, sizeRef: 'server' }
+  } else {
+    try { logWorkerStream?.end() } catch {}
+    if (currentLogDate !== dateStr) { logRotatedWorkerIndex = 0; logWorkerFileSize = 0 }
+    else logRotatedWorkerIndex += 1
+    logWorkerStream = fsSync.createWriteStream(logFileName('worker', dateStr, logRotatedWorkerIndex), { flags: 'a', encoding: 'utf8' })
+    currentLogDate = dateStr
+    return { stream: logWorkerStream, sizeRef: 'worker' }
+  }
+}
+
+function flushLogs() {
+  logFlushQueue = logFlushQueue.then(async () => {
+    try {
+      const { stream: serverStream, sizeRef: serverSizeRef } = await ensureLogStream('server')
+      const { stream: workerStream, sizeRef: workerSizeRef } = await ensureLogStream('worker')
+      const serverLines = drainRing(logServerRing)
+      const workerLines = drainRing(logWorkerRing)
+      let serverBatch = ''
+      for (const { t, level, text } of serverLines) {
+        serverBatch += `[${new Date(t).toISOString()}] [${level}] ${text}\n`
+      }
+      let workerBatch = ''
+      for (const { t, level, text } of workerLines) {
+        workerBatch += `[${new Date(t).toISOString()}] [${level}] ${text}\n`
+      }
+      if (serverBatch) {
+        serverStream.write(serverBatch)
+        logServerFileSize += Buffer.byteLength(serverBatch, 'utf8')
+      }
+      if (workerBatch) {
+        workerStream.write(workerBatch)
+        logWorkerFileSize += Buffer.byteLength(workerBatch, 'utf8')
+      }
+      // 每天第一次 flush 时触发一次过期清理
+      scheduleLogCleanup()
+    } catch (error) {
+      try { process.stderr.write(`[logger] flush failed: ${error.message}\n`) } catch {}
+    }
+  })
+}
+
+let logCleanupTimer = null
+function scheduleLogCleanup() {
+  if (logCleanupTimer) return
+  logCleanupTimer = setTimeout(async () => {
+    logCleanupTimer = null
+    try { await cleanupOldLogFiles() } catch {}
+    // 下一次清理定在 24 小时后
+    logCleanupTimer = setTimeout(() => { logCleanupTimer = null }, 24 * 60 * 60 * 1000)
+  }, 10000)  // 启动 10 秒后跑第一次
+}
+
+// options: { mode: 'auto' | 'age' | 'count' | 'all', days?, totalFiles? }
+// mode=auto: 用默认常量（定时清理用）
+// mode=age:  只按天数删
+// mode=count: 只按文件总数删
+// mode=all:  清空 logs 目录下所有 .log
+async function cleanupOldLogFiles(options = {}) {
+  if (!fsSync.existsSync(logDir)) return { scanned: 0, deleted: 0, freedBytes: 0 }
+  const { mode = 'auto', days, totalFiles } = options
+  const entries = await fs.readdir(logDir, { withFileTypes: true })
+  const now = Date.now()
+  const files = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.log')) continue
+    const filePath = path.join(logDir, entry.name)
+    try {
+      const stat = await fs.stat(filePath)
+      files.push({ path: filePath, mtime: stat.mtimeMs, size: stat.size })
+    } catch {}
+  }
+  files.sort((a, b) => a.mtime - b.mtime)
+  let deleted = 0
+  let freedBytes = 0
+  if (mode === 'all') {
+    for (const { path: filePath, size } of files) {
+      try { await fs.unlink(filePath); deleted++; freedBytes += size } catch {}
+    }
+    return { scanned: files.length, deleted, freedBytes }
+  }
+  const effectiveDays = mode === 'age' ? (Number(days) || LOG_MAX_AGE_DAYS) : LOG_MAX_AGE_DAYS
+  const effectiveTotal = mode === 'count' ? (Number(totalFiles) || LOG_MAX_TOTAL_FILES) : LOG_MAX_TOTAL_FILES
+  const cutoff = effectiveDays * 24 * 60 * 60 * 1000
+  let keepCount = files.length
+  for (const { path: filePath, mtime, size } of files) {
+    const tooOld = now - mtime > cutoff && mode !== 'count'
+    const tooMany = keepCount > effectiveTotal && mode !== 'age'
+    if (tooOld || tooMany) {
+      try { await fs.unlink(filePath); deleted++; freedBytes += size; keepCount-- } catch {}
+    } else break  // 从老的开始
+  }
+  return { scanned: files.length, deleted, freedBytes }
+}
+
+// drainRing 只把已经入队等待写盘的那些行拿走，同时保留在内存缓冲里给 admin 页读
+// 这里的"drain"其实是"批量写盘"的语义，不会把 ring 清空
+function drainRing(ring) {
+  return ring.slice(-50)  // 每次批量写最后 50 条，避免一次写太多
+}
+
+function installConsoleInterceptor() {
+  const originalLog = console.log
+  const originalWarn = console.warn
+  const originalError = console.error
+  const formatArgs = (args) => {
+    try {
+      if (args.length === 1 && typeof args[0] === 'string') return args[0]
+      return utilFormatSafe(args)
+    } catch { return String(args[0]) }
+  }
+  console.log = (...args) => {
+    originalLog.apply(console, args)
+    logLine('server', 'info', formatArgs(args))
+  }
+  console.warn = (...args) => {
+    originalWarn.apply(console, args)
+    logLine('server', 'warn', formatArgs(args))
+  }
+  console.error = (...args) => {
+    originalError.apply(console, args)
+    logLine('server', 'error', formatArgs(args))
+  }
+}
+
+// 不引入 util 模块，避免顶部 require 时循环依赖；用简单拼接足够
+function utilFormatSafe(args) {
+  return args.map((a) => {
+    if (a === null) return 'null'
+    if (a === undefined) return 'undefined'
+    if (typeof a === 'object') {
+      try { return JSON.stringify(a).slice(0, 500) } catch { return '[Circular]' }
+    }
+    return String(a)
+  }).join(' ')
+}
+
+function getLogRing(stream, n = 100) {
+  const ring = stream === 'worker' ? logWorkerRing : logServerRing
+  return ring.slice(-Math.min(n, LOG_RING_LINES)).map(({ t, level, text }) => ({
+    t: new Date(t).toISOString(), level, text,
+  }))
 }
 
 function emptyStats() {
@@ -104,7 +286,7 @@ function emptyStats() {
 function loadStats() {
   try {
     const saved = JSON.parse(fsSync.readFileSync(usageFile, 'utf8'))
-    const recent = Array.isArray(saved.recent) ? saved.recent.slice(0, 100) : []
+    const recent = Array.isArray(saved.recent) ? saved.recent.slice(0, MAX_RECENT_REQUESTS) : []
     const modelUsage = {}
     if (saved.modelUsage && typeof saved.modelUsage === 'object') {
       for (const [model, count] of Object.entries(saved.modelUsage)) {
@@ -115,9 +297,10 @@ function loadStats() {
         if (item.status === 'success' && item.model) modelUsage[item.model] = (modelUsage[item.model] || 0) + 1
       }
     }
+    const daily = saved.daily && typeof saved.daily === 'object' ? pruneDaily(saved.daily) : {}
     return {
       totals: { ...emptyStats().totals, ...saved.totals },
-      daily: saved.daily && typeof saved.daily === 'object' ? saved.daily : {},
+      daily,
       recent,
       modelUsage,
     }
@@ -138,8 +321,8 @@ let resourceTimer = null
 let uploadInProgress = false
 let pullInProgress = false
 let modelTransfer = null
-let hotModelId = configuredHotModel || null
-let hotModelPinned = Boolean(configuredHotModel)
+let hotModelIds = configuredHotModel ? new Set(configuredHotModel.split(',').map((s) => s.trim()).filter(Boolean)) : new Set()
+let hotModelPinned = Boolean(configuredHotModel) && hotModelIds.size > 0
 let shuttingDown = false
 let activeRequests = 0
 let queuedRequests = 0
@@ -150,6 +333,11 @@ const maintenanceCounts = new Map()
 const maintenanceTails = new Map()
 let cpuPrevious = null
 let cpuUsage = { totalPercent: 0, perCore: [] }
+const MAX_RECENT_REQUESTS = 500
+const MAX_DAILY_DAYS = 15
+let memoryMonitorTimer = null
+let memoryPressure = 'ok'   // 'ok' | 'soft' | 'hard'
+let lastMemoryPressureAt = 0
 const heartbeat = {
   enabled: keepAliveEnabled,
   url: keepAliveUrl,
@@ -160,7 +348,16 @@ const heartbeat = {
   consecutiveFailures: 0,
 }
 
+function pruneDaily(daily) {
+  const days = Object.keys(daily).sort().slice(-MAX_DAILY_DAYS)
+  const result = {}
+  for (const day of days) result[day] = daily[day]
+  return result
+}
+
 function persistStats() {
+  stats.recent = stats.recent.slice(0, MAX_RECENT_REQUESTS)
+  stats.daily = pruneDaily(stats.daily)
   const snapshot = `${JSON.stringify(stats, null, 2)}\n`
   persistQueue = persistQueue
     .then(() => fs.writeFile(usageFile, snapshot, 'utf8'))
@@ -188,7 +385,7 @@ function recordRequest(entry) {
   stats.daily[day] = daily
 
   stats.recent.unshift(entry)
-  stats.recent = stats.recent.slice(0, 100)
+  stats.recent = stats.recent.slice(0, MAX_RECENT_REQUESTS)
   persistStats()
 }
 
@@ -436,52 +633,60 @@ async function selectModel(id) {
   return findModelInList(models, defaultModelId) ?? models[0]
 }
 
-function preferredHotModel(models) {
-  if (hotModelPinned) return findModelInList(models, configuredHotModel) || null
+function preferredHotModels(models) {
+  if (hotModelPinned) {
+    return [...hotModelIds]
+      .map((id) => findModelInList(models, id))
+      .filter(Boolean)
+  }
+  // 用户显式选过 hotModelIds（Set 非空且没 pinned）→ 尊重他们
+  if (hotModelIds.size > 0) {
+    return [...hotModelIds]
+      .map((id) => findModelInList(models, id))
+      .filter(Boolean)
+  }
+  // 完全没配置时，自动挑最常用的一个
   const ranked = Object.entries(stats.modelUsage)
     .filter(([, count]) => count > 0)
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'zh-CN'))
   for (const [id] of ranked) {
     const entry = findModelInList(models, id)
-    if (entry) return entry
+    if (entry) return [entry]
   }
-  if (hotModelId) {
-    const current = findModelInList(models, hotModelId)
-    if (current) return current
-  }
-  return findModelInList(models, defaultModelId) ?? models[0] ?? null
+  return [findModelInList(models, defaultModelId) ?? models[0]].filter(Boolean)
 }
 
 function promoteHotModel(modelId) {
-  if (hotModelPinned || !modelId || modelId === hotModelId) return
-  const currentCount = stats.modelUsage[hotModelId] || 0
-  if (!hotModelId || (stats.modelUsage[modelId] || 0) > currentCount) {
-    hotModelId = modelId
-    console.log(`热启动模型自动切换为 ${modelId}`)
-    scheduleIdleUnload()
-  }
+  if (hotModelPinned || !modelId) return
+  // 多热启动模式下，promote 只负责加入集合；如果 Set 已有内容就不动
+  if (hotModelIds.size > 0) return
+  const current = [...runtimes.values()].find((state) => state.entry.id === modelId)
+  if (current) hotModelIds.add(modelId)
 }
 
 async function warmHotModel() {
   const models = await scanModels()
-  let entry = preferredHotModel(models)
-  if (!entry && hotModelPinned) {
-    console.error(`HOT_MODEL 指定的模型不存在：${configuredHotModel}，改为自动选择`)
-    hotModelPinned = false
-    hotModelId = null
-    entry = preferredHotModel(models)
+  const targets = preferredHotModels(models)
+  if (hotModelPinned) {
+    const missing = [...hotModelIds].filter((id) => !findModelInList(models, id))
+    if (missing.length) {
+      console.error(`HOT_MODEL 指定的模型不存在：${missing.join(', ')}`)
+      // 清掉不存在的，保留能找到的
+      for (const id of missing) hotModelIds.delete(id)
+    }
   }
-  if (!entry) return
-  hotModelId = entry.id
+  if (targets.length === 0) return
   try {
-    await enqueue(async () => {
-      const existing = [...runtimes.values()].find((state) => state.entry.id === entry.id && !state.stopping)
-      if (existing) return existing.loadPromise
-      return ensureRuntime(entry)
-    })
-    console.log(`热启动模型 ${entry.id} 已常驻，空闲回收会自动跳过`)
+    for (const entry of targets) {
+      await enqueue(async () => {
+        const existing = [...runtimes.values()].find((state) => state.entry.id === entry.id && !state.stopping)
+        if (existing) return existing.loadPromise
+        return ensureRuntime(entry)
+      })
+      console.log(`热启动模型 ${entry.id} 已常驻，空闲回收会自动跳过`)
+    }
   } catch (error) {
-    console.error(`热启动模型 ${entry.id} 预热失败：${error.message}`)
+    console.error(`热启动模型预热失败：${error.message}`)
   }
 }
 
@@ -500,7 +705,7 @@ function serializeModel(entry) {
     lastUsedAt: latest?.lastUsedAt ? new Date(latest.lastUsedAt).toISOString() : null,
     contextSize: current.length > 0 ? contextSize : null,
     instanceCount: current.length,
-    isHot: entry.id === hotModelId,
+    isHot: hotModelIds.has(entry.id),
     usageCount: stats.modelUsage[entry.id] || 0,
   }
 }
@@ -509,6 +714,53 @@ function formatByteSize(bytes) {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
   return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
+}
+
+// --- cgroup 资源感知（Linux 容器）---
+let cachedCgroup = null
+async function readCgroupInfo() {
+  if (cachedCgroup) return cachedCgroup
+  const info = {
+    memoryLimitBytes: 0,
+    cpuMaxCount: 0,
+    cpuQuotaFactor: 0,
+    source: '',
+  }
+  try {
+    // cgroup v2
+    if (fsSync.existsSync('/sys/fs/cgroup/memory.max')) {
+      const raw = (await fs.readFile('/sys/fs/cgroup/memory.max', 'utf8')).trim()
+      if (raw !== 'max') info.memoryLimitBytes = Number(raw)
+    }
+    if (fsSync.existsSync('/sys/fs/cgroup/cpu.max')) {
+      const [quota, period] = (await fs.readFile('/sys/fs/cgroup/cpu.max', 'utf8')).trim().split(/\s+/)
+      if (quota !== 'max' && period !== '0') {
+        const q = Number(quota), p = Number(period)
+        if (Number.isFinite(q) && Number.isFinite(p) && q > 0 && p > 0) {
+          info.cpuQuotaFactor = q / p
+          info.cpuMaxCount = Math.ceil(info.cpuQuotaFactor)
+        }
+      }
+    }
+    info.source = 'v2'
+  } catch {}
+  // cgroup v1 fallback
+  if (!info.memoryLimitBytes && fsSync.existsSync('/sys/fs/cgroup/memory/memory.limit_in_bytes')) {
+    try {
+      const raw = (await fs.readFile('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8')).trim()
+      const val = Number(raw)
+      if (Number.isFinite(val) && val > 0 && val < 1024 ** 4) info.memoryLimitBytes = val
+      info.source = info.source || 'v1'
+    } catch {}
+  }
+  cachedCgroup = info
+  return info
+}
+
+function effectiveCpuCount(cgroup, hostCount) {
+  if (cgroup?.cpuMaxCount && cgroup.cpuMaxCount < hostCount) return cgroup.cpuMaxCount
+  if (cgroup?.cpuQuotaFactor && cgroup.cpuQuotaFactor < hostCount) return Math.max(1, Math.round(cgroup.cpuQuotaFactor))
+  return hostCount
 }
 
 function getMemoryLimitBytes() {
@@ -520,6 +772,68 @@ function getMemoryLimitBytes() {
     } catch {}
   }
   return os.totalmem()
+}
+
+// 估算单个模型加载后的运行时内存开销（不只是文件本身）
+// base: Node 主进程 + worker + allocator 开销；context: KV cache（粗略按 512B/token × 2）
+function perModelOverheadBytes(context) {
+  if (modelMemoryOverheadMb > 0) return modelMemoryOverheadMb * 1024 ** 2
+  const contextTokens = context || contextSize
+  const kvCacheBytes = contextTokens * 512 * 2
+  return memoryOverheadBaseMb * 1024 ** 2 + kvCacheBytes
+}
+
+function currentRssBytes() {
+  return process.memoryUsage().rss + [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
+}
+
+// 每隔 memoryMonitorIntervalMs 采样一次内存；超软限自动卸载非热启动模型，超硬限切 hard 状态拒绝新请求
+function startMemoryMonitor() {
+  if (memoryMonitorTimer) return
+  memoryMonitorTimer = setInterval(async () => {
+    const limit = getMemoryLimitBytes()
+    if (!limit || limit <= 0) return
+    const rss = currentRssBytes()
+    const ratio = rss / limit
+    let nextPressure = 'ok'
+    if (ratio >= hardLimitRatio) nextPressure = 'hard'
+    else if (ratio >= softLimitRatio) nextPressure = 'soft'
+    if (nextPressure !== memoryPressure) {
+      const prev = memoryPressure
+      memoryPressure = nextPressure
+      lastMemoryPressureAt = Date.now()
+      console.log(`内存压力 ${prev} → ${nextPressure}：RSS ${formatByteSize(rss)} / 上限 ${formatByteSize(limit)}（${(ratio * 100).toFixed(1)}%）`)
+    }
+    // 软/硬限都尝试自动降级（卸载非热启动模型），但硬限不会阻塞正在跑的请求（只阻止新的入队）
+    if (ratio >= softLimitRatio) {
+      await autoTrimMemory(limit, softLimitRatio)
+    }
+  }, memoryMonitorIntervalMs)
+  memoryMonitorTimer.unref()
+}
+
+async function autoTrimMemory(limit, targetRatio) {
+  // 卸载最旧的非热启动 runtimes，直到 RSS 回到 targetRatio * limit 以下
+  const targetRss = limit * (targetRatio - 0.05)
+  const nonHot = [...runtimes.values()]
+    .filter((state) => !hotModelIds.has(state.entry.id) && state.loaded && !state.pending && !state.stopping)
+    .sort((a, b) => (a.lastUsedAt || 0) - (b.lastUsedAt || 0))
+  const toUnload = []
+  let estimatedSaved = 0
+  for (const state of nonHot) {
+    if (currentRssBytes() - estimatedSaved <= targetRss) break
+    toUnload.push(state)
+    estimatedSaved += (state.stats?.rssBytes || state.entry.sizeBytes + perModelOverheadBytes())
+  }
+  if (toUnload.length === 0) return
+  console.log(`内存预警：自动卸载 ${toUnload.length} 个非热启动模型以降内存`)
+  for (const state of toUnload) {
+    try {
+      await stopRuntime(state)
+    } catch (error) {
+      console.error(`自动卸载 ${state.entry.id} 失败：${error.message}`)
+    }
+  }
 }
 
 function sampleCpu() {
@@ -550,8 +864,18 @@ function startResourceMonitor() {
 }
 
 async function getSystemResources(modelBytes) {
-  const totalMemoryBytes = os.totalmem()
-  const freeMemoryBytes = os.freemem()
+  const cgroup = await readCgroupInfo()
+  const hostCores = os.cpus().length
+  const effectiveCores = effectiveCpuCount(cgroup, hostCores)
+  // 内存：容器有 cgroup 限定时，用 min(宿主机 totalmem, cgroup limit)；否则用宿主机值
+  let totalMemoryBytes = os.totalmem()
+  let freeMemoryBytes = os.freemem()
+  if (cgroup?.memoryLimitBytes && cgroup.memoryLimitBytes < totalMemoryBytes) {
+    totalMemoryBytes = cgroup.memoryLimitBytes
+    // 容器内 free 不准，用 total - rss 近似
+    const rss = process.memoryUsage().rss + [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
+    freeMemoryBytes = Math.max(0, totalMemoryBytes - rss)
+  }
   const runtimeRssBytes = [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
   let disk = null
   try {
@@ -572,10 +896,11 @@ async function getSystemResources(modelBytes) {
     sampledAt: new Date().toISOString(),
     cpu: {
       usagePercent: cpuUsage.totalPercent,
-      cores: os.cpus().length,
-      perCore: cpuUsage.perCore,
+      cores: effectiveCores,
+      hostCores,
+      perCore: cpuUsage.perCore.slice(0, effectiveCores),
       loadAverage,
-      loadPercent: os.cpus().length > 0 ? loadAverage[0] / os.cpus().length * 100 : 0,
+      loadPercent: effectiveCores > 0 ? loadAverage[0] / effectiveCores * 100 : 0,
     },
     memory: {
       totalBytes: totalMemoryBytes,
@@ -586,17 +911,20 @@ async function getSystemResources(modelBytes) {
       limitBytes: getMemoryLimitBytes(),
     },
     disk,
+    cgroup: cgroup.source ? { source: cgroup.source, cpuQuotaFactor: cgroup.cpuQuotaFactor || 0 } : null,
   }
 }
 
 function assertModelFits(entry) {
   const limit = getMemoryLimitBytes()
-  const overhead = modelMemoryOverheadMb * 1024 ** 2
-  if (entry.sizeBytes + overhead > limit) {
+  const softLimit = limit * softLimitRatio
+  const currentUsed = currentRssBytes()
+  const overhead = perModelOverheadBytes()
+  if (currentUsed + entry.sizeBytes + overhead > softLimit) {
     throw new HttpError(
       400,
-      `模型文件 ${formatByteSize(entry.sizeBytes)} 加上运行预留 ${formatByteSize(overhead)} 超过内存上限 ${formatByteSize(limit)}，已阻止加载`,
-      'model_too_large',
+      `当前内存已用 ${formatByteSize(currentUsed)}，加载 ${entry.id}（${formatByteSize(entry.sizeBytes)}）后将超过安全阈值 ${formatByteSize(softLimit)}，已阻止加载；请先卸载不用的模型或降低 CONTEXT_SIZE`,
+      'memory_budget_exceeded',
       'model',
     )
   }
@@ -604,14 +932,14 @@ function assertModelFits(entry) {
 
 function assertPoolFits(entry) {
   const limit = getMemoryLimitBytes()
-  const overhead = modelMemoryOverheadMb * 1024 ** 2
   const residentBytes = [...runtimes.values()]
     .filter((state) => !state.stopping)
-    .reduce((total, state) => total + state.entry.sizeBytes + overhead, 0)
-  if (residentBytes + entry.sizeBytes + overhead > limit) {
+    .reduce((total, state) => total + state.entry.sizeBytes + perModelOverheadBytes(), 0)
+  const softLimit = limit * softLimitRatio
+  if (residentBytes + entry.sizeBytes + perModelOverheadBytes() > softLimit) {
     throw new HttpError(
       429,
-      `按当前并发驻留估算需要 ${formatByteSize(residentBytes + entry.sizeBytes + overhead)}，超过内存上限 ${formatByteSize(limit)}，请降低并发或先卸载模型`,
+      `按当前并发驻留估算需要 ${formatByteSize(residentBytes + entry.sizeBytes + perModelOverheadBytes())}，超过内存安全阈值 ${formatByteSize(softLimit)}，请降低并发或先卸载模型`,
       'memory_budget_exceeded',
       'model',
     )
@@ -741,8 +1069,16 @@ async function spawnRuntime(entry) {
       failRuntime(state, new HttpError(503, `推理进程意外退出（${signal || code}）`, 'runtime_crashed'))
     }
   })
-  child.stdout.on('data', (chunk) => process.stdout.write(`[${entry.id}] ${chunk}`))
-  child.stderr.on('data', (chunk) => process.stderr.write(`[${entry.id}] ${chunk}`))
+  child.stdout.on('data', (chunk) => {
+    const text = String(chunk).trimEnd()
+    process.stdout.write(`[${entry.id}] ${chunk}`)
+    if (text) logLine('worker', 'info', `[${entry.id}] ${text}`)
+  })
+  child.stderr.on('data', (chunk) => {
+    const text = String(chunk).trimEnd()
+    process.stderr.write(`[${entry.id}] ${chunk}`)
+    if (text) logLine('worker', 'error', `[${entry.id}] ${text}`)
+  })
 
   state.loadTimer = setTimeout(() => {
     settleLoad(state, new HttpError(504, '模型加载超时', 'model_load_timeout'))
@@ -842,7 +1178,7 @@ function scheduleIdleUnload() {
   if (runtimes.size === 0 || shuttingDown) return
   if (activeRequests > 0 || queuedRequests > 0) return
   const candidates = [...runtimes.values()].filter((state) => (
-    state.loaded && !state.pending && !state.stopping && state.entry.id !== hotModelId && !blockedModels.has(state.entry.id)
+    state.loaded && !state.pending && !state.stopping && !hotModelIds.has(state.entry.id) && !blockedModels.has(state.entry.id)
   ))
   if (candidates.length === 0) return
   const wait = Math.max(1000, ...candidates.map((state) => modelIdleTimeoutMs - (Date.now() - state.lastUsedAt)))
@@ -854,7 +1190,7 @@ function scheduleIdleUnload() {
     }
     const due = [...runtimes.values()].filter((state) => (
       state.loaded && !state.pending && !state.stopping
-      && state.entry.id !== hotModelId && !blockedModels.has(state.entry.id)
+      && !hotModelIds.has(state.entry.id) && !blockedModels.has(state.entry.id)
       && Date.now() - state.lastUsedAt >= modelIdleTimeoutMs
     ))
     for (const state of due) {
@@ -936,6 +1272,14 @@ function finishSse(res, requestId, createdAt, modelId, result, includeUsage) {
 
 async function handleChat(req, res) {
   requireAuth(req, apiKey)
+  if (memoryPressure === 'hard') {
+    const retrySec = 30
+    res.setHeader('Retry-After', retrySec)
+    throw new HttpError(503, `内存接近上限，暂时拒绝新请求（RSS ${formatByteSize(currentRssBytes())} / 阈值 ${(hardLimitRatio * 100).toFixed(0)}%），${retrySec} 秒后重试`, 'memory_pressure_hard')
+  } else if (memoryPressure === 'soft') {
+    // 软限不直接拒绝，但打个 warn log；后台已经在自动卸载非热启动模型
+    console.warn(`内存预警（soft）：新请求入队，当前 RSS ${formatByteSize(currentRssBytes())}`)
+  }
   let requestId
   let startedAt
   let controller
@@ -1041,7 +1385,7 @@ function handleHealth(req, res) {
     status: shuttingDown ? 'shutting_down' : 'ok',
     model: modelIds.length === 1 ? modelIds[0] : modelIds.length > 1 ? modelIds : null,
     uptimeSeconds: Math.floor(process.uptime()),
-    hotModel: hotModelId,
+    hotModelIds: [...hotModelIds],
     queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, maxQueue },
     heartbeat: {
       enabled: heartbeat.enabled,
@@ -1088,7 +1432,7 @@ async function handleAdminUnload(req, res) {
   const id = await readModelSelector(req)
   const entry = await resolveModel(id)
   if (!entry) throw new HttpError(404, `模型不存在：${id}`, 'model_not_found', 'model')
-  if (entry.id === hotModelId) throw new HttpError(409, '热启动模型需保持常驻，不能手动卸载', 'hot_model_locked', 'model')
+  if (hotModelIds.has(entry.id)) throw new HttpError(409, '热启动模型需保持常驻，不能手动卸载', 'hot_model_locked', 'model')
   await enqueue(() => withModelMaintenance(entry.id, () => stopRuntimesFor(entry.id)))
   sendJson(res, 200, { ok: true })
 }
@@ -1098,7 +1442,7 @@ async function handleAdminDelete(req, res) {
   const id = await readModelSelector(req)
   const entry = await resolveModel(id)
   if (!entry) throw new HttpError(404, `模型不存在：${id}`, 'model_not_found', 'model')
-  const wasHot = entry.id === hotModelId
+  const wasHot = hotModelIds.has(entry.id)
   await enqueue(() => withModelMaintenance(entry.id, async () => {
     await stopRuntimesFor(entry.id)
     try {
@@ -1107,7 +1451,7 @@ async function handleAdminDelete(req, res) {
       if (error.code !== 'ENOENT') throw error
     }
     delete stats.modelUsage[entry.id]
-    if (wasHot) hotModelId = null
+    hotModelIds.delete(entry.id)
     persistStats()
   }))
   if (wasHot) await warmHotModel()
@@ -1133,7 +1477,7 @@ async function handleAdminRename(req, res) {
   }
 
   const targetPath = path.join(modelDir, newName)
-  const wasHot = entry.id === hotModelId
+  const wasHot = hotModelIds.has(entry.id)
   await enqueue(() => withModelMaintenance(entry.id, async () => {
     await stopRuntimesFor(entry.id)
     try {
@@ -1150,7 +1494,10 @@ async function handleAdminRename(req, res) {
     }
     if (defaultModelId === entry.id || defaultModelId === entry.name) defaultModelId = newName
     if (hotModelPinned && (configuredHotModel === entry.id || configuredHotModel === entry.name)) configuredHotModel = newName
-    if (wasHot) hotModelId = newName
+    if (wasHot) {
+      hotModelIds.delete(entry.id)
+      hotModelIds.add(newName)
+    }
     stats.modelUsage[newName] = (stats.modelUsage[entry.id] || 0) + (stats.modelUsage[newName] || 0)
     delete stats.modelUsage[entry.id]
     persistStats()
@@ -1361,7 +1708,7 @@ async function ensureModelLinksFile() {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error
   }
-  await writeModelLinksConfig({ version: 1, models: defaultModelLinks.map((item) => ({ ...item })) })
+  await writeModelLinksConfig({ version: 1, models: [] })
 }
 
 function mutateModelLinks(mutator) {
@@ -1651,6 +1998,70 @@ async function handleAdminModelLinksPullMissing(req, res) {
       results,
       models: (await scanModels()).map(serializeModel),
     })
+  } finally {
+    pullInProgress = false
+    modelTransfer = null
+  }
+}
+
+async function handleAdminHotModelsUpdate(req, res) {
+  requireAuth(req, adminKey)
+  if (hotModelPinned) throw new HttpError(400, 'HOT_MODEL 环境变量已固定热启动模型，面板无法修改，请先清除环境变量', 'hot_model_pinned')
+  const body = await readJson(req)
+  if (!body || typeof body !== 'object' || !Array.isArray(body.modelIds)) {
+    throw new HttpError(400, 'modelIds 必须是字符串数组', 'invalid_value', 'modelIds')
+  }
+  const ids = body.modelIds.map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean)
+  const allModels = await scanModels()
+  const invalid = ids.filter((id) => !findModelInList(allModels, id))
+  if (invalid.length) throw new HttpError(400, `以下模型不存在：${invalid.join(', ')}`, 'model_not_found', 'modelIds')
+  const newSet = new Set(ids)
+  const removed = [...hotModelIds].filter((id) => !newSet.has(id))
+  hotModelIds = newSet
+  // 卸载被移除的热启动模型
+  if (removed.length > 0) {
+    for (const id of removed) {
+      await stopRuntimesFor(id)
+    }
+  }
+  // 预热新加入的
+  if (hotModelIds.size > 0) await warmHotModel()
+  sendJson(res, 200, { ok: true, hotModelIds: [...hotModelIds], models: allModels.map(serializeModel) })
+}
+
+async function handleAdminModelLinkPullOne(req, res, id) {
+  requireAuth(req, adminKey)
+  if (uploadInProgress || pullInProgress) throw new HttpError(409, '已有模型正在传输，请稍后再试', 'transfer_in_progress')
+  const config = await readModelLinksConfig()
+  const link = config.models.find((entry) => entry.id === id)
+  if (!link) throw new HttpError(404, `模型链接不存在：${id}`, 'link_not_found')
+  if (!link.url) throw new HttpError(400, `模型链接缺少下载地址`, 'invalid_url')
+  const localModels = await scanModels()
+  const local = findModelInList(localModels, id)
+  if (local) {
+    if (link.sizeBytes && local.sizeBytes !== link.sizeBytes) {
+      throw new HttpError(409, '本地文件大小与配置不一致，为避免覆盖已跳过；请先手动删除再拉取', 'model_exists_size_mismatch')
+    }
+    throw new HttpError(409, '本地已存在该模型，如需重新拉取请先删除本地文件', 'model_exists')
+  }
+  const controller = new AbortController()
+  req.once('aborted', () => controller.abort(new Error('客户端已断开')))
+  pullInProgress = true
+  modelTransfer = { type: 'pull', status: 'connecting', filename: id, receivedBytes: 0, totalBytes: 0 }
+  try {
+    const pulled = await downloadModelToModelDir({
+      url: link.url,
+      name: id,
+      signal: controller.signal,
+      expectedSizeBytes: link.sizeBytes,
+      expectedSha256: link.sha256,
+      onProgress(progress) {
+        modelTransfer = { ...modelTransfer, ...progress }
+        if (progress.receivedBytes !== undefined) modelTransfer.receivedBytes = progress.receivedBytes
+      },
+    })
+    await recordPulledModelLink({ id: pulled.filename, url: link.url, sizeBytes: pulled.sizeBytes, sha256: pulled.sha256 })
+    sendJson(res, 201, { ok: true, model: serializeModel(pulled.entry) })
   } finally {
     pullInProgress = false
     modelTransfer = null
@@ -2005,11 +2416,20 @@ async function handleAdminStats(req, res) {
     runtime: runtimeInfo,
     serverRssBytes,
     memoryLimitBytes: getMemoryLimitBytes(),
-    modelMemoryOverheadBytes: modelMemoryOverheadMb * 1024 ** 2,
+    memoryPressure,
+    memoryPressureAt: lastMemoryPressureAt ? new Date(lastMemoryPressureAt).toISOString() : null,
+    memoryThresholds: {
+      softRatio: softLimitRatio,
+      hardRatio: hardLimitRatio,
+      softBytes: getMemoryLimitBytes() * softLimitRatio,
+      hardBytes: getMemoryLimitBytes() * hardLimitRatio,
+    },
+    modelMemoryOverheadBytes: modelMemoryOverheadMb > 0 ? modelMemoryOverheadMb * 1024 ** 2 : perModelOverheadBytes(),
+    contextSize,
     modelIdleTimeoutMs,
     maxModelBytes,
     maxConcurrencyLimit,
-    hotModelId,
+    hotModelIds: [...hotModelIds],
     hotModelPinned,
     system,
     transfer: modelTransfer,
@@ -2108,6 +2528,32 @@ async function route(req, res) {
   }
   if (url.pathname === '/admin/api/concurrency' && req.method === 'POST') return handleAdminConcurrency(req, res)
   if (url.pathname === '/admin/api/reset-usage' && req.method === 'POST') return handleAdminReset(req, res)
+  if (url.pathname === '/admin/api/hot-models' && req.method === 'POST') return handleAdminHotModelsUpdate(req, res)
+  if (url.pathname === '/admin/api/logs' && (req.method === 'GET' || req.method === 'POST')) {
+    requireAuth(req, adminKey)
+    if (req.method === 'POST') {
+      let body = {}
+      try { body = await readJson(req) } catch {}
+      const result = await cleanupOldLogFiles({
+        mode: body.mode || 'auto',
+        days: body.days,
+        totalFiles: body.totalFiles,
+      })
+      return sendJson(res, 200, { ok: true, ...result })
+    }
+    const query = new URL(req.url, 'http://localhost').searchParams
+    const stream = query.get('stream') === 'worker' ? 'worker' : 'server'
+    const n = Math.min(Number(query.get('n')) || 100, LOG_RING_LINES)
+    return sendJson(res, 200, { stream, lines: getLogRing(stream, n), file: logFileName(stream, new Date().toISOString().slice(0, 10)) })
+  }
+  {
+    const modelLinkPullOneMatch = /^\/admin\/api\/model-links\/([^/]+)\/pull$/.exec(url.pathname)
+    if (modelLinkPullOneMatch && req.method === 'POST') {
+      let id
+      try { id = decodeURIComponent(modelLinkPullOneMatch[1]) } catch { throw new HttpError(400, '模型链接 ID 编码无效', 'invalid_value', 'id') }
+      return handleAdminModelLinkPullOne(req, res, id)
+    }
+  }
   if (url.pathname === '/admin/api/models/upload' && req.method === 'POST') return handleAdminUpload(req, res)
   if (url.pathname === '/admin/api/models/pull' && req.method === 'POST') return handleAdminPull(req, res)
   if (url.pathname === '/admin/api/models/download' && req.method === 'GET') return handleAdminDownload(req, res)
@@ -2142,6 +2588,8 @@ async function shutdown() {
 
 async function main() {
   await fs.mkdir(modelDir, { recursive: true })
+  await fs.mkdir(logDir, { recursive: true })
+  installConsoleInterceptor()
   await ensureModelLinksFile()
   try {
     await readModelLinksConfig()
@@ -2151,6 +2599,7 @@ async function main() {
   await fs.access(workerPath)
   adminHtml = await fs.readFile(path.join(projectRoot, 'admin.html'), 'utf8')
   startResourceMonitor()
+  startMemoryMonitor()
   const models = await scanModels()
   console.log(`模型目录：${modelDir}`)
   console.log(`模型链接配置：${modelLinksFile}`)
