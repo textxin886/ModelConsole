@@ -1,4 +1,4 @@
-require('dotenv').config()
+require('dotenv').config({ path: require('node:path').join(__dirname, '..', '.env') })
 const http = require('node:http')
 const https = require('node:https')
 const crypto = require('node:crypto')
@@ -14,7 +14,7 @@ const { once } = require('node:events')
 const { pipeline } = require('node:stream/promises')
 const Busboy = require('busboy')
 
-const projectRoot = __dirname
+const projectRoot = path.resolve(__dirname, '..')
 const logDir = path.join(projectRoot, 'logs')
 const port = Number(process.env.PORT || 25682)
 const host = process.env.HOST || '0.0.0.0'

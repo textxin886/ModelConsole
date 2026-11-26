@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const outputDir = path.join(root, 'dist')
 const runtimeFiles = [
-  'index.js',
+  'server/index.js',
   'start.js',
   'workers/inference-worker.js',
   'config/models.config.json',

@@ -5,4 +5,4 @@ console.log('[start] building...')
 execSync('npm run build', { stdio: 'inherit' })
 
 console.log('[start] starting...')
-require('./index.js')
+require('./server/index.js')
