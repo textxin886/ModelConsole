@@ -7,7 +7,6 @@ coverage/
 web/
 
 # 容器本地状态，禁止入库，git pull 不会覆盖
-.env
 config/models.config.json
 
 usage.json
