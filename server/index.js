@@ -12,6 +12,7 @@ const zlib = require('node:zlib')
 const { spawn } = require('node:child_process')
 const { once } = require('node:events')
 const { pipeline } = require('node:stream/promises')
+const llamaServer = process.platform === 'linux' ? require('./llamaServerManager.js') : null
 const Busboy = require('busboy')
 
 const projectRoot = path.resolve(__dirname, '..')
@@ -22,7 +23,7 @@ const threads = Number(process.env.THREADS || 2)
 const contextSize = Number(process.env.CONTEXT_SIZE || 2048)
 let maxConcurrency = Number(process.env.MAX_CONCURRENCY || 1)
 const maxConcurrencyLimit = 8
-const maxQueue = Number(process.env.MAX_QUEUE || 8)
+const queueTimeoutMs = Number(process.env.QUEUE_TIMEOUT_MS || 300000)
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 120000)
 const maxBodyBytes = Number(process.env.MAX_BODY_BYTES || 1048576)
 const modelDir = path.resolve(process.env.MODEL_DIR || path.join(projectRoot, 'models'))
@@ -44,14 +45,14 @@ const apiKey = process.env.API_KEY || `sk-${crypto.randomBytes(24).toString('hex
 const adminKey = process.env.ADMIN_KEY || apiKey
 const adminDownloadCookie = crypto.createHmac('sha256', adminKey).update('rea-admin-download-v1').digest('hex')
 const usageFile = path.join(projectRoot, 'usage.json')
-const modelLinksFile = path.resolve(process.env.MODEL_LINKS_FILE || path.join(projectRoot, 'config', 'models.config.json'))
+const modelLinksFile = path.resolve(process.env.MODEL_LINKS_FILE || path.join(projectRoot, 'config', 'models.config.jsonl'))
 const workerPath = path.join(projectRoot, 'workers', 'inference-worker.js')
 const defaultSystemPrompt = '你是一个乐于助人的中文助手。回答简洁、准确。'
 const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED !== 'false'
 const keepAliveIntervalMs = Number(process.env.KEEP_ALIVE_INTERVAL_MS || 300000)
 const keepAliveUrl = process.env.KEEP_ALIVE_URL || `${publicBaseUrl}/health`
 
-for (const [name, value] of Object.entries({ port, threads, contextSize, maxQueue, requestTimeoutMs, maxBodyBytes, modelIdleTimeoutMs, modelLoadTimeoutMs, maxModelBytes, keepAliveIntervalMs })) {
+for (const [name, value] of Object.entries({ port, threads, contextSize, queueTimeoutMs, requestTimeoutMs, maxBodyBytes, modelIdleTimeoutMs, modelLoadTimeoutMs, maxModelBytes, keepAliveIntervalMs })) {
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} 必须是正整数`)
 }
 if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > maxConcurrencyLimit) {
@@ -445,6 +446,11 @@ function sendError(res, error) {
 }
 
 async function readJson(req) {
+  const { json } = await readJsonRaw(req)
+  return json
+}
+
+async function readJsonRaw(req) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
@@ -453,8 +459,9 @@ async function readJson(req) {
     chunks.push(chunk)
   }
   if (chunks.length === 0) throw new HttpError(400, '请求体不能为空', 'invalid_json')
+  const raw = Buffer.concat(chunks)
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    return { json: JSON.parse(raw.toString('utf8')), raw }
   } catch {
     throw new HttpError(400, '请求体不是合法 JSON', 'invalid_json')
   }
@@ -477,6 +484,8 @@ function drainQueue() {
   while (activeRequests < maxConcurrency && taskQueue.length > 0) {
     const item = taskQueue.shift()
     queuedRequests -= 1
+    clearTimeout(item.timer)
+    item.started = true
     runTask(item.task).then(item.resolve, item.reject)
   }
 }
@@ -487,9 +496,18 @@ function enqueue(task) {
   if (activeRequests < maxConcurrency) {
     result = runTask(task)
   } else {
-    if (queuedRequests >= maxQueue) throw new HttpError(429, '推理队列已满，请稍后重试', 'queue_full')
     queuedRequests += 1
-    result = new Promise((resolve, reject) => taskQueue.push({ task, resolve, reject }))
+    result = new Promise((resolve, reject) => {
+      const item = { task, resolve, reject, started: false, timer: null }
+      item.timer = setTimeout(() => {
+        if (item.started) return
+        const index = taskQueue.indexOf(item)
+        if (index >= 0) taskQueue.splice(index, 1)
+        queuedRequests -= 1
+        reject(new HttpError(504, `排队超过 ${Math.round(queueTimeoutMs / 60000)} 分钟仍未轮到推理，请重试`, 'queue_timeout'))
+      }, queueTimeoutMs)
+      taskQueue.push(item)
+    })
   }
   queueTail = Promise.allSettled([queueTail, result]).then(() => {})
   return result
@@ -502,6 +520,42 @@ function contentToText(content) {
     .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
     .map((part) => part.text)
     .join('')
+}
+
+const maxImageDataChars = 14 * 1024 * 1024
+
+function extractImageParts(content) {
+  if (!Array.isArray(content)) return []
+  const images = []
+  for (const part of content) {
+    if (!part || part.type !== 'image_url') continue
+    const raw = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url
+    if (typeof raw !== 'string' || !raw.trim()) {
+      throw new HttpError(400, 'image_url.url 不能为空', 'invalid_content', 'messages')
+    }
+    const value = raw.trim()
+    const isDataUrl = /^data:image\/[a-z0-9.+-]+;base64,/i.test(value)
+    let isHttpUrl = false
+    try {
+      const target = new URL(value)
+      isHttpUrl = ['http:', 'https:'].includes(target.protocol)
+    } catch {}
+    if (!isDataUrl && !isHttpUrl) {
+      throw new HttpError(400, 'image_url 仅支持 data:image/...;base64 或 http(s) 地址', 'invalid_content', 'messages')
+    }
+    if (isDataUrl && value.length > maxImageDataChars) {
+      throw new HttpError(413, '单张图片不能超过 10MB（base64 编码后 14MB）', 'image_too_large', 'messages')
+    }
+    images.push(value)
+  }
+  return images
+}
+
+const capabilityLabels = { text: '文本对话', vision: '多模态识图', transcription: '语音转文字', image: '图片生成' }
+
+function capabilityLabel(caps) {
+  const labels = (caps || []).map((cap) => capabilityLabels[cap] || cap)
+  return labels.length ? labels.join(' / ') : '未知类型'
 }
 
 function validateChatRequest(body) {
@@ -526,11 +580,17 @@ function validateChatRequest(body) {
       throw new HttpError(400, `messages[${index}].role 无效`, 'invalid_role', `messages[${index}].role`)
     }
     const text = contentToText(message.content)
-    if (!text.trim() && message.role === 'user') {
+    const images = message.role === 'user' ? extractImageParts(message.content) : []
+    if (!text.trim() && !images.length && message.role === 'user') {
       throw new HttpError(400, `messages[${index}].content 不能为空`, 'invalid_content', `messages[${index}].content`)
     }
-    return { role: message.role, text }
+    return { role: message.role, text, images }
   })
+
+  const totalImages = messages.reduce((sum, message) => sum + message.images.length, 0)
+  if (totalImages > 4) {
+    throw new HttpError(400, '单次请求最多包含 4 张图片', 'too_many_images', 'messages')
+  }
 
   if (messages.at(-1).role !== 'user') {
     throw new HttpError(400, '最后一条消息必须是 user', 'invalid_messages', 'messages')
@@ -572,11 +632,17 @@ function validateChatRequest(body) {
       ? { type: 'user', text: message.text }
       : { type: 'model', response: [message.text] })
 
+  let enableThinking
+  if (body.enable_thinking !== undefined) enableThinking = body.enable_thinking === true
+  else if (body.chat_template_kwargs && typeof body.chat_template_kwargs === 'object' && body.chat_template_kwargs.enable_thinking !== undefined) enableThinking = body.chat_template_kwargs.enable_thinking === true
+  else if (body.reasoning_effort !== undefined) enableThinking = body.reasoning_effort !== 'none'
+
   return {
     model: body.model,
     systemPrompt,
     history,
     prompt: messages.at(-1).text,
+    images: messages.at(-1).images,
     maxTokens,
     temperature,
     topP,
@@ -584,7 +650,112 @@ function validateChatRequest(body) {
     stop,
     stream: body.stream === true,
     includeUsage: body.stream_options?.include_usage === true,
+    enableThinking,
   }
+}
+
+// ---- GGUF 元数据解析与模型能力识别 ----
+// 只读取文件头部 KV 段（通常 <1MB），按 mtime+size 缓存，避免重复解析
+const ggufCapsCache = new Map()
+const visionArchitectures = new Set(['llava', 'bakllava', 'llava-v1.5', 'llava-bak-cs', 'llava-phi-3', 'qwen2-vl', 'qwen2.5-vl', 'qwen-vl', 'mllama', 'granite-vision', 'minicpm-v', 'moondream', 'nemotron-vlm', 'gemma-3', 'pixtral', 'internvl', 'kimi-vl', 'llama4'])
+const imageGenArchitectures = new Set(['janus', 'janus-pro', 'emmu', 'sdxl', 'flux'])
+
+function parseGgufMeta(buffer) {
+  const dv = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  let offset = 0
+  let truncated = false
+  const need = (n) => { if (offset + n > buffer.length) { truncated = true; throw new Error('truncated') } }
+  const magic = buffer.toString('latin1', 0, 4)
+  if (magic !== 'GGUF') throw new Error('不是 GGUF 文件')
+  offset = 4
+  need(4)
+  const version = dv.getUint32(offset, true); offset += 4
+  if (version < 2) throw new Error(`不支持的 GGUF 版本 ${version}`)
+  need(16)
+  const nTensors = Number(dv.getBigUint64(offset, true)); offset += 8
+  const nKv = Number(dv.getBigUint64(offset, true)); offset += 8
+  const readString = () => {
+    need(8)
+    const len = Number(dv.getBigUint64(offset, true)); offset += 8
+    if (len > 1024 * 1024) throw new Error('字符串过长')
+    need(len)
+    const s = buffer.toString('utf8', offset, offset + len); offset += len
+    return s
+  }
+  const readValue = (type) => {
+    switch (type) {
+      case 0: need(1); { const v = dv.getUint8(offset); offset += 1; return v }
+      case 1: need(1); { const v = dv.getInt8(offset); offset += 1; return v }
+      case 2: need(2); { const v = dv.getUint16(offset, true); offset += 2; return v }
+      case 3: need(2); { const v = dv.getInt16(offset, true); offset += 2; return v }
+      case 4: need(4); { const v = dv.getUint32(offset, true); offset += 4; return v }
+      case 5: need(4); { const v = dv.getInt32(offset, true); offset += 4; return v }
+      case 6: need(4); { const v = dv.getFloat32(offset, true); offset += 4; return v }
+      case 7: need(8); { const v = dv.getBigUint64(offset, true); offset += 8; return Number(v) }
+      case 8: need(8); { const v = dv.getBigInt64(offset, true); offset += 8; return Number(v) }
+      case 9: need(8); { const v = dv.getFloat64(offset, true); offset += 8; return v }
+      case 10: need(1); { const v = dv.getUint8(offset); offset += 1; return v === 1 }
+      case 11: return readString()
+      case 12: {
+        need(12)
+        const elemType = dv.getUint32(offset, true); offset += 4
+        const len = Number(dv.getBigUint64(offset, true)); offset += 8
+        if (len > 200000) throw new Error('数组过长')
+        const arr = []
+        for (let i = 0; i < len; i += 1) arr.push(readValue(elemType))
+        return arr
+      }
+      default: throw new Error(`未知 GGUF 值类型 ${type}`)
+    }
+  }
+  const meta = {}
+  for (let i = 0; i < nKv; i += 1) {
+    const key = readString()
+    need(4)
+    const type = dv.getUint32(offset, true); offset += 4
+    meta[key] = readValue(type)
+  }
+  void nTensors
+  return { meta, truncated }
+}
+
+function detectModelCapabilities(meta) {
+  const arch = String(meta['general.architecture'] || '')
+  const caps = []
+  const keys = Object.keys(meta)
+  const hasVisionKeys = keys.some((key) => /^(mmproj|vision|clip)\./.test(key))
+  if (arch === 'whisper') return ['transcription']
+  if (imageGenArchitectures.has(arch)) caps.push('image')
+  if (visionArchitectures.has(arch) || hasVisionKeys) caps.push('vision')
+  if (meta['tokenizer.ggml.tokens'] || meta['tokenizer.chat_template'] || caps.length === 0) caps.push('text')
+  return caps
+}
+
+async function readModelCapabilities(filePath, stat) {
+  const cacheKey = `${stat.mtimeMs}:${stat.size}`
+  const cached = ggufCapsCache.get(filePath)
+  if (cached && cached.cacheKey === cacheKey) return cached.capabilities
+  let capabilities = ['text']
+  const handle = await fs.open(filePath, 'r').catch(() => null)
+  if (handle) {
+    try {
+      for (const size of [1024 * 1024, 4 * 1024 * 1024]) {
+        const buffer = Buffer.alloc(Math.min(size, stat.size))
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+        try {
+          const { meta } = parseGgufMeta(buffer.subarray(0, bytesRead))
+          capabilities = detectModelCapabilities(meta)
+          break
+        } catch (error) {
+          if (error.message !== 'truncated' || size === 4 * 1024 * 1024) break
+        }
+      }
+    } finally {
+      await handle.close().catch(() => {})
+    }
+  }
+  ggufCapsCache.set(filePath, { cacheKey, capabilities })
+  return capabilities
 }
 
 async function scanModels() {
@@ -604,6 +775,7 @@ async function scanModels() {
         sizeBytes: stat.size,
         createdAt: new Date(createdMs).toISOString(),
         modifiedAt: stat.mtime.toISOString(),
+        capabilities: await readModelCapabilities(filePath, stat),
       })
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
@@ -669,7 +841,7 @@ function promoteHotModel(modelId) {
 
 async function warmHotModel() {
   const models = await scanModels()
-  const targets = preferredHotModels(models)
+  const targets = preferredHotModels(models).filter((entry) => !entry.capabilities || entry.capabilities.includes('text'))
   if (hotModelPinned) {
     const missing = [...hotModelIds].filter((id) => !findModelInList(models, id))
     if (missing.length) {
@@ -708,6 +880,7 @@ function serializeModel(entry) {
     lastUsedAt: latest?.lastUsedAt ? new Date(latest.lastUsedAt).toISOString() : null,
     contextSize: current.length > 0 ? contextSize : null,
     instanceCount: current.length,
+    capabilities: entry.capabilities || ['text'],
     isHot: hotModelIds.has(entry.id),
     usageCount: stats.modelUsage[entry.id] || 0,
   }
@@ -756,8 +929,37 @@ async function readCgroupInfo() {
       info.source = info.source || 'v1'
     } catch {}
   }
+  // 用量文件路径（每次采样实时读取，这里只缓存存在性）
+  if (fsSync.existsSync('/sys/fs/cgroup/memory.current')) info.memoryUsageFile = '/sys/fs/cgroup/memory.current'
+  else if (fsSync.existsSync('/sys/fs/cgroup/memory/memory.usage_in_bytes')) info.memoryUsageFile = '/sys/fs/cgroup/memory/memory.usage_in_bytes'
+  if (fsSync.existsSync('/sys/fs/cgroup/cpu.stat')) info.cpuStatFile = '/sys/fs/cgroup/cpu.stat'
+  else if (fsSync.existsSync('/sys/fs/cgroup/cpu/cpuacct.usage')) info.cpuUsageFile = '/sys/fs/cgroup/cpu/cpuacct.usage'
   cachedCgroup = info
   return info
+}
+
+// 实时读取 cgroup 用量：内存字节数 + CPU 累计使用（微秒）
+async function readCgroupUsage(info) {
+  const out = { memoryUsedBytes: null, cpuUsedUsec: null }
+  if (info.memoryUsageFile) {
+    try {
+      const val = Number((await fs.readFile(info.memoryUsageFile, 'utf8')).trim())
+      if (Number.isFinite(val) && val >= 0) out.memoryUsedBytes = val
+    } catch {}
+  }
+  if (info.cpuStatFile) {
+    try {
+      const raw = await fs.readFile(info.cpuStatFile, 'utf8')
+      const match = raw.match(/^usage_usec\s+(\d+)$/m)
+      if (match) out.cpuUsedUsec = Number(match[1])
+    } catch {}
+  } else if (info.cpuUsageFile) {
+    try {
+      const val = Number((await fs.readFile(info.cpuUsageFile, 'utf8')).trim())
+      if (Number.isFinite(val) && val >= 0) out.cpuUsedUsec = val / 1000
+    } catch {}
+  }
+  return out
 }
 
 function effectiveCpuCount(cgroup, hostCount) {
@@ -839,7 +1041,31 @@ async function autoTrimMemory(limit, targetRatio) {
   }
 }
 
-function sampleCpu() {
+let cgroupCpuPrevious = null
+
+async function sampleCpu() {
+  const cgroup = await readCgroupInfo()
+  const usage = await readCgroupUsage(cgroup)
+  // 容器模式：用 cgroup CPU 累计用量差值 / 墙钟时间差值 / 配额核数
+  if (usage.cpuUsedUsec != null) {
+    const effectiveCores = effectiveCpuCount(cgroup, os.cpus().length)
+    const now = Date.now()
+    if (cgroupCpuPrevious && cgroupCpuPrevious.usec <= usage.cpuUsedUsec) {
+      const wallSec = (now - cgroupCpuPrevious.at) / 1000
+      const coresUsed = (usage.cpuUsedUsec - cgroupCpuPrevious.usec) / 1e6 / wallSec
+      cpuUsage = {
+        totalPercent: Math.max(0, Math.min(100, coresUsed / effectiveCores * 100)),
+        coresUsed,
+        perCore: null,
+        container: true,
+        quotaCores: effectiveCores,
+      }
+    } else if (!cpuUsage.container) {
+      cpuUsage = { totalPercent: 0, coresUsed: 0, perCore: null, container: true, quotaCores: effectiveCores }
+    }
+    cgroupCpuPrevious = { at: now, usec: usage.cpuUsedUsec }
+    return
+  }
   const cpus = os.cpus()
   const current = cpus.map((cpu) => {
     const times = Object.values(cpu.times).reduce((total, value) => total + value, 0)
@@ -853,46 +1079,75 @@ function sampleCpu() {
       return totalDelta > 0 ? Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100)) : 0
     })
     const total = perCore.reduce((sum, value) => sum + value, 0)
-    cpuUsage = { totalPercent: total / perCore.length, perCore }
+    cpuUsage = { totalPercent: total / perCore.length, perCore, container: false, coresUsed: total / perCore.length * perCore.length / 100 }
   } else {
-    cpuUsage = { totalPercent: 0, perCore: current.map(() => 0) }
+    cpuUsage = { totalPercent: 0, perCore: current.map(() => 0), container: false }
   }
   cpuPrevious = { cpus: current }
 }
 
 function startResourceMonitor() {
-  sampleCpu()
-  resourceTimer = setInterval(sampleCpu, 1000)
+  const tick = () => { sampleCpu().catch(() => {}) }
+  tick()
+  resourceTimer = setInterval(tick, 1000)
   resourceTimer.unref()
 }
 
 async function getSystemResources(modelBytes) {
   const cgroup = await readCgroupInfo()
+  const cgroupUsage = await readCgroupUsage(cgroup)
   const hostCores = os.cpus().length
   const effectiveCores = effectiveCpuCount(cgroup, hostCores)
-  // 内存：容器有 cgroup 限定时，用 min(宿主机 totalmem, cgroup limit)；否则用宿主机值
+  // 内存：优先 cgroup 实际用量/配额；无 cgroup 时用宿主机值
   let totalMemoryBytes = os.totalmem()
+  let usedMemoryBytes = totalMemoryBytes - os.freemem()
   let freeMemoryBytes = os.freemem()
   if (cgroup?.memoryLimitBytes && cgroup.memoryLimitBytes < totalMemoryBytes) {
     totalMemoryBytes = cgroup.memoryLimitBytes
-    // 容器内 free 不准，用 total - rss 近似
-    const rss = process.memoryUsage().rss + [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
-    freeMemoryBytes = Math.max(0, totalMemoryBytes - rss)
+    if (cgroupUsage.memoryUsedBytes != null) {
+      usedMemoryBytes = Math.min(cgroupUsage.memoryUsedBytes, totalMemoryBytes)
+      freeMemoryBytes = totalMemoryBytes - usedMemoryBytes
+    } else {
+      // 用量不可读时退回进程 RSS 近似
+      const rss = process.memoryUsage().rss + [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
+      usedMemoryBytes = Math.min(rss, totalMemoryBytes)
+      freeMemoryBytes = totalMemoryBytes - usedMemoryBytes
+    }
+  } else if (cgroupUsage.memoryUsedBytes != null && cgroupUsage.memoryUsedBytes < usedMemoryBytes) {
+    usedMemoryBytes = cgroupUsage.memoryUsedBytes
   }
   const runtimeRssBytes = [...runtimes.values()].reduce((total, state) => total + (state.stats?.rssBytes || 0), 0)
+  // 磁盘：Linux 下同时探测模型目录与容器根路径，取容量更小的挂载点（容器配额通常只体现在 / 上）
   let disk = null
-  try {
-    const stat = await fs.statfs(modelDir)
-    const totalBytes = stat.bsize * stat.blocks
-    const freeBytes = stat.bsize * stat.bavail
+  const quotaOverride = Number(process.env.DISK_QUOTA_BYTES || 0)
+  const seen = []
+  const probeTargets = process.platform === 'linux' ? [modelDir, path.sep] : [modelDir]
+  for (const target of probeTargets) {
+    try {
+      const stat = await fs.statfs(target)
+      seen.push({ target, totalBytes: stat.bsize * stat.blocks, freeBytes: stat.bsize * stat.bavail })
+    } catch {}
+  }
+  if (seen.length) {
+    seen.sort((left, right) => left.totalBytes - right.totalBytes)
+    const best = seen[0]
+    let totalBytes = best.totalBytes
+    let freeBytes = best.freeBytes
+    let scope = best.target === path.sep ? '容器根分区' : '模型分区'
+    if (Number.isFinite(quotaOverride) && quotaOverride > 0 && quotaOverride < totalBytes) {
+      totalBytes = quotaOverride
+      freeBytes = Math.max(0, Math.min(freeBytes, totalBytes))
+      scope = '配额（DISK_QUOTA_BYTES）'
+    }
     disk = {
-      path: modelDir,
+      path: best.target,
+      scope: seen.length > 1 || quotaOverride > 0 ? `${scope} · 共探测 ${seen.length} 个挂载点` : scope,
       totalBytes,
       freeBytes,
       usedBytes: Math.max(0, totalBytes - freeBytes),
       modelBytes,
     }
-  } catch {}
+  }
 
   const loadAverage = os.loadavg()
   return {
@@ -901,14 +1156,16 @@ async function getSystemResources(modelBytes) {
       usagePercent: cpuUsage.totalPercent,
       cores: effectiveCores,
       hostCores,
-      perCore: cpuUsage.perCore.slice(0, effectiveCores),
+      perCore: cpuUsage.perCore ? cpuUsage.perCore.slice(0, effectiveCores) : null,
+      container: !!cpuUsage.container,
+      coresUsed: cpuUsage.coresUsed || 0,
       loadAverage,
       loadPercent: effectiveCores > 0 ? loadAverage[0] / effectiveCores * 100 : 0,
     },
     memory: {
       totalBytes: totalMemoryBytes,
       freeBytes: freeMemoryBytes,
-      usedBytes: Math.max(0, totalMemoryBytes - freeMemoryBytes),
+      usedBytes: usedMemoryBytes,
       processBytes: process.memoryUsage().rss,
       runtimeBytes: runtimeRssBytes,
       limitBytes: getMemoryLimitBytes(),
@@ -995,7 +1252,7 @@ function handleRuntimeMessage(state, message) {
     return
   }
   if (message.type === 'chunk' && state.pending?.requestId === message.requestId) {
-    state.pending.onTextChunk?.(message.text)
+    state.pending.onChunk?.(message.text, message.kind || 'text')
     return
   }
   if (message.type === 'result' && state.pending?.requestId === message.requestId) {
@@ -1003,6 +1260,7 @@ function handleRuntimeMessage(state, message) {
     state.lastUsedAt = Date.now()
     settlePending(state, null, {
       text: message.text,
+      thoughts: message.thoughts || null,
       finishReason: message.finishReason,
       promptTokens: message.promptTokens,
       completionTokens: message.completionTokens,
@@ -1205,9 +1463,9 @@ function scheduleIdleUnload() {
   idleTimer.unref()
 }
 
-function runtimeGenerate(state, options, signal, onTextChunk) {
+function runtimeGenerate(state, options, signal, onChunk) {
   const requestId = crypto.randomUUID()
-  const pending = { requestId, signal, onTextChunk, cancelTimer: null, onAbort: null, promise: null }
+  const pending = { requestId, signal, onChunk, cancelTimer: null, onAbort: null, promise: null }
   const promise = new Promise((resolve, reject) => {
     pending.resolve = resolve
     pending.reject = reject
@@ -1273,6 +1531,15 @@ function finishSse(res, requestId, createdAt, modelId, result, includeUsage) {
   if (!res.destroyed && !res.writableEnded) res.end('data: [DONE]\n\n')
 }
 
+function collectStream(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    stream.on('data', (chunk) => chunks.push(chunk))
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    stream.on('error', reject)
+  })
+}
+
 async function handleChat(req, res) {
   requireAuth(req, apiKey)
   if (memoryPressure === 'hard') {
@@ -1296,26 +1563,57 @@ async function handleChat(req, res) {
   let selectedModel
 
   try {
-    const options = validateChatRequest(await readJson(req))
+    const { json, raw } = await readJsonRaw(req)
+    const options = validateChatRequest(json)
     selectedModel = await selectModel(options.model)
     options.model = selectedModel.id
+    const caps = selectedModel.capabilities || ['text']
+    if (options.images.length > 0) {
+      if (!caps.includes('vision')) {
+        throw new HttpError(400, '该模型不支持图片输入，请改用视觉模型（如 qwen2.5-vl / llava / minicpm-v 系列）', 'model_not_vision', 'model')
+      }
+      if (!llamaServer) {
+        throw new HttpError(501, '多模态识图接口已就绪，但当前运行环境不支持 llama-server 引擎（仅 Linux 容器可用）；识图请求已按 OpenAI 格式校验', 'vision_engine_unavailable')
+      }
+      const instance = await llamaServer.getInstance(selectedModel.path)
+      const proxied = await llamaServer.proxy(instance, '/v1/chat/completions', 'application/json', raw)
+      if (options.stream) {
+        applyHeaders(res, { 'Content-Type': proxied.headers['content-type'] || 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' })
+        res.writeHead(proxied.status)
+        proxied.stream.pipe(res)
+      } else {
+        const text = await collectStream(proxied.stream)
+        res.writeHead(proxied.status, { 'Content-Type': 'application/json' })
+        res.end(text)
+        try {
+          const parsed = JSON.parse(text)
+          if (parsed.usage) { promptTokens = parsed.usage.prompt_tokens || 0; completionTokens = parsed.usage.completion_tokens || 0 }
+          finishReason = parsed.choices?.[0]?.finish_reason || finishReason
+        } catch {}
+      }
+      status = 'success'
+      return
+    }
+    if (!caps.includes('text')) {
+      throw new HttpError(400, `模型类型为「${capabilityLabel(caps)}」，不支持聊天补全，请改用文本模型`, 'model_not_chat', 'model')
+    }
     stream = options.stream
     requestId = `chatcmpl-${crypto.randomUUID()}`
     const createdAt = Math.floor(Date.now() / 1000)
     startedAt = Date.now()
     controller = new AbortController()
-    timer = setTimeout(() => controller.abort(new Error('请求超时')), requestTimeoutMs)
     res.once('close', () => {
       if (!res.writableEnded) controller.abort(new Error('客户端断开连接'))
     })
 
     await enqueue(async () => {
       if (controller.signal.aborted) throw controller.signal.reason
+      timer = setTimeout(() => controller.abort(new Error('请求超时')), requestTimeoutMs)
       const state = await ensureRuntime(selectedModel)
       if (controller.signal.aborted) throw controller.signal.reason
       if (stream) startSse(res, requestId, createdAt, selectedModel.id)
       const generated = await runtimeGenerate(state, options, controller.signal, stream
-        ? (text) => writeSseChunk(res, requestId, createdAt, selectedModel.id, { content: text })
+        ? (text, kind) => writeSseChunk(res, requestId, createdAt, selectedModel.id, kind === 'thought' ? { reasoning_content: text } : { content: text })
         : undefined)
       promptTokens = generated.promptTokens
       completionTokens = generated.completionTokens
@@ -1324,12 +1622,14 @@ async function handleChat(req, res) {
       if (stream) {
         finishSse(res, requestId, createdAt, selectedModel.id, generated, options.includeUsage)
       } else {
+        const assistantMessage = { role: 'assistant', content: generated.text }
+        if (generated.thoughts) assistantMessage.reasoning_content = generated.thoughts
         sendJson(res, 200, {
           id: requestId,
           object: 'chat.completion',
           created: createdAt,
           model: selectedModel.id,
-          choices: [{ index: 0, message: { role: 'assistant', content: generated.text }, finish_reason: generated.finishReason }],
+          choices: [{ index: 0, message: assistantMessage, finish_reason: generated.finishReason }],
           usage: {
             prompt_tokens: generated.promptTokens,
             completion_tokens: generated.completionTokens,
@@ -1378,8 +1678,107 @@ async function handleModels(req, res) {
       permission: [],
       root: entry.id,
       parent: null,
+      capabilities: entry.capabilities || ['text'],
     })),
   })
+}
+
+// ---- OpenAI 格式：语音转文字 / 图片生成（能力校验 + 接口预留）----
+const maxAudioUploadBytes = 50 * 1024 * 1024
+
+function readMultipartBuffered(req, fileLimitBytes) {
+  return new Promise((resolve, reject) => {
+    let parser
+    try {
+      parser = Busboy({ headers: req.headers, limits: { fileSize: fileLimitBytes, files: 1, fields: 10 } })
+    } catch (error) {
+      reject(new HttpError(400, `解析 multipart 表单失败：${error.message}`, 'invalid_multipart'))
+      return
+    }
+    const fields = {}
+    const files = []
+    let truncated = false
+    let settled = false
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      req.destroy()
+      reject(error)
+    }
+    parser.on('field', (name, value) => { fields[name] = value })
+    parser.on('file', (name, stream, info) => {
+      const chunks = []
+      stream.on('data', (chunk) => chunks.push(chunk))
+      stream.on('limit', () => { truncated = true; stream.resume() })
+      stream.on('end', () => {
+        if (!truncated) files.push({ field: name, filename: info.filename, mimeType: info.mimeType, buffer: Buffer.concat(chunks) })
+      })
+      stream.on('error', fail)
+    })
+    parser.on('error', (error) => fail(new HttpError(400, `解析 multipart 表单失败：${error.message}`, 'invalid_multipart')))
+    parser.on('close', () => {
+      if (settled) return
+      if (truncated) { fail(new HttpError(413, `音频文件不能超过 ${formatByteSize(fileLimitBytes)}`, 'audio_too_large')); return }
+      settled = true
+      resolve({ fields, files })
+    })
+    req.on('error', fail)
+    req.pipe(parser)
+  })
+}
+
+async function handleAudioTranscriptions(req, res) {
+  requireAuth(req, apiKey)
+  const { fields, files } = await readMultipartBuffered(req, maxAudioUploadBytes)
+  const audio = files.find((item) => item.field === 'file')
+  if (!audio || !audio.buffer.length) throw new HttpError(400, '缺少 multipart 字段 file（音频文件）', 'invalid_audio', 'file')
+  const entry = await selectModel(fields.model)
+  const caps = entry.capabilities || []
+  if (!caps.includes('transcription')) {
+    throw new HttpError(400, `模型类型为「${capabilityLabel(caps)}」，不支持语音转文字，请改用 whisper 系列 GGUF 模型`, 'model_not_whisper', 'model')
+  }
+  if (!llamaServer) {
+    throw new HttpError(501, '语音转文字接口已按 OpenAI 格式就绪，但当前运行环境不支持 llama-server 引擎（仅 Linux 容器可用）', 'transcription_engine_unavailable')
+  }
+  const instance = await llamaServer.getInstance(entry.path)
+  const proxied = await llamaServer.transcribe(instance, audio.buffer, {
+    filename: audio.filename,
+    mimeType: audio.mimeType,
+    language: fields.language,
+    prompt: fields.prompt,
+  })
+  const text = await collectStream(proxied.stream)
+  if (proxied.status < 200 || proxied.status >= 300) {
+    res.writeHead(proxied.status, { 'Content-Type': 'application/json' })
+    res.end(text)
+    return
+  }
+  let parsed
+  try { parsed = JSON.parse(text) } catch { parsed = { text } }
+  if (fields.response_format === 'verbose_json') {
+    sendJson(res, 200, parsed)
+  } else if (fields.response_format === 'text') {
+    applyHeaders(res, { 'Content-Type': 'text/plain; charset=utf-8' })
+    res.writeHead(200)
+    res.end(String(parsed.text ?? ''))
+  } else {
+    sendJson(res, 200, { text: String(parsed.text ?? '') })
+  }
+}
+
+async function handleImageGenerations(req, res) {
+  requireAuth(req, apiKey)
+  const body = await readJson(req)
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, '请求体必须是 JSON 对象', 'invalid_request')
+  if (typeof body.prompt !== 'string' || !body.prompt.trim()) throw new HttpError(400, 'prompt 必须是非空字符串', 'invalid_value', 'prompt')
+  if (body.model !== undefined && (typeof body.model !== 'string' || !body.model.trim())) throw new HttpError(400, 'model 必须是非空字符串', 'invalid_value', 'model')
+  if (body.n !== undefined && body.n !== 1) throw new HttpError(400, '当前仅支持 n=1', 'unsupported_value', 'n')
+  const entry = await selectModel(body.model)
+  const caps = entry.capabilities || []
+  if (!caps.includes('image')) {
+    throw new HttpError(400, `模型类型为「${capabilityLabel(caps)}」，不支持图片生成，请改用图片生成模型（如 janus 系列 GGUF）`, 'model_not_image_gen', 'model')
+  }
+  throw new HttpError(501, '图片生成接口已按 OpenAI 格式就绪，但 llama.cpp / llama-server 均不支持图片生成类 GGUF 模型；该能力仍为预留接口', 'image_generation_not_supported')
 }
 
 function handleHealth(req, res) {
@@ -1389,7 +1788,7 @@ function handleHealth(req, res) {
     model: modelIds.length === 1 ? modelIds[0] : modelIds.length > 1 ? modelIds : null,
     uptimeSeconds: Math.floor(process.uptime()),
     hotModelIds: [...hotModelIds],
-    queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, maxQueue },
+    queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, queueTimeoutMs },
     heartbeat: {
       enabled: heartbeat.enabled,
       lastSuccessAt: heartbeat.lastSuccessAt,
@@ -1463,6 +1862,10 @@ async function handleAdminLoad(req, res) {
   requireAuth(req, adminKey)
   const id = await readModelSelector(req)
   const entry = await selectModel(id)
+  const caps = entry.capabilities || ['text']
+  if (!caps.includes('text')) {
+    throw new HttpError(400, `模型类型为「${capabilityLabel(caps)}」，无法作为对话模型加载`, 'model_not_chat', 'model')
+  }
   await enqueue(() => ensureRuntime(entry))
   sendJson(res, 200, { ok: true, model: serializeModel(entry) })
 }
@@ -1721,20 +2124,34 @@ async function readModelLinksConfig() {
     if (error.code === 'ENOENT') return { version: 1, models: [] }
     throw new HttpError(500, `模型链接配置读取失败：${error.message}`, 'model_links_read_error')
   }
-  let saved
-  try {
-    saved = JSON.parse(raw)
-  } catch (error) {
-    throw new HttpError(500, `模型链接配置不是合法 JSON：${error.message}`, 'invalid_model_links_config')
+  // JSONL：每行一个模型链接对象；兼容旧版整体 JSON 对象格式（{version, models}）
+  const trimmed = raw.trim()
+  let legacy = null
+  try { legacy = JSON.parse(trimmed) } catch {}
+  if (legacy && typeof legacy === 'object' && !Array.isArray(legacy) && Array.isArray(legacy.models)) {
+    return normalizeModelLinksConfig(legacy)
   }
-  return normalizeModelLinksConfig(saved)
+  const models = []
+  const lines = trimmed ? trimmed.split(/\r?\n/) : []
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue
+    let item
+    try {
+      item = JSON.parse(line)
+    } catch (error) {
+      throw new HttpError(500, `模型链接配置第 ${index + 1} 行不是合法 JSON：${error.message}`, 'invalid_model_links_config')
+    }
+    models.push(item)
+  }
+  return normalizeModelLinksConfig({ version: 1, models })
 }
 
 async function writeModelLinksConfig(config) {
   const normalized = normalizeModelLinksConfig(config)
+  const body = normalized.models.map((model) => JSON.stringify(model)).join('\n')
   const tempPath = `${modelLinksFile}.${process.pid}.${crypto.randomUUID()}.tmp`
   try {
-    await fs.writeFile(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
+    await fs.writeFile(tempPath, body ? `${body}\n` : '', 'utf8')
     await fs.rename(tempPath, modelLinksFile)
   } finally {
     await fs.rm(tempPath, { force: true }).catch(() => {})
@@ -1840,10 +2257,10 @@ async function handleAdminModelLinkDelete(req, res, requestedId) {
 async function handleAdminModelLinksExport(req, res) {
   requireDownloadAuth(req)
   const config = await readModelLinksConfig()
-  const body = `${JSON.stringify(config, null, 2)}\n`
+  const body = config.models.length ? `${config.models.map((model) => JSON.stringify(model)).join('\n')}\n` : ''
   applyHeaders(res, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Disposition': contentDisposition('models.config.json'),
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Content-Disposition': contentDisposition('models.config.jsonl'),
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
   })
@@ -2093,6 +2510,11 @@ async function handleAdminHotModelsUpdate(req, res) {
   const allModels = await scanModels()
   const invalid = ids.filter((id) => !findModelInList(allModels, id))
   if (invalid.length) throw new HttpError(400, `以下模型不存在：${invalid.join(', ')}`, 'model_not_found', 'modelIds')
+  const notChat = ids.filter((id) => {
+    const entry = findModelInList(allModels, id)
+    return entry.capabilities && !entry.capabilities.includes('text')
+  })
+  if (notChat.length) throw new HttpError(400, `以下模型不是文本对话类型，无法热启动：${notChat.join(', ')}`, 'model_not_chat', 'modelIds')
   const newSet = new Set(ids)
   const removed = [...hotModelIds].filter((id) => !newSet.has(id))
   hotModelIds = newSet
@@ -2471,7 +2893,7 @@ async function handleAdminConcurrency(req, res) {
   }
   maxConcurrency = value
   drainQueue()
-  sendJson(res, 200, { ok: true, queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, maxQueue } })
+  sendJson(res, 200, { ok: true, queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, queueTimeoutMs } })
 }
 
 async function handleAdminStats(req, res) {
@@ -2523,6 +2945,7 @@ async function handleAdminStats(req, res) {
     hotModelIds: [...hotModelIds],
     hotModelPinned,
     system,
+    llamaServer: llamaServer ? llamaServer.status() : null,
     transfer: {
       upload: uploadInProgress ? uploadTransfer : null,
       active: activeTransferInfo(),
@@ -2530,7 +2953,7 @@ async function handleAdminStats(req, res) {
     },
     publicBaseUrl,
     uptimeSeconds: Math.floor(process.uptime()),
-    queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, maxQueue },
+    queue: { active: activeRequests, queued: queuedRequests, maxActive: maxConcurrency, queueTimeoutMs },
     heartbeat,
     totals: {
       ...stats.totals,
@@ -2603,6 +3026,8 @@ async function route(req, res) {
   if (url.pathname === '/health' && req.method === 'GET') return handleHealth(req, res)
   if (url.pathname === '/v1/models' && req.method === 'GET') return handleModels(req, res)
   if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return handleChat(req, res)
+  if (url.pathname === '/v1/audio/transcriptions' && req.method === 'POST') return handleAudioTranscriptions(req, res)
+  if (url.pathname === '/v1/images/generations' && req.method === 'POST') return handleImageGenerations(req, res)
   if (url.pathname === '/admin' && req.method === 'GET') return handleAdminPage(req, res)
   if (url.pathname.startsWith('/admin/assets/') && req.method === 'GET') return handleAdminAsset(req, res, url.pathname)
   if (url.pathname === '/admin/api/stats' && req.method === 'GET') return handleAdminStats(req, res)
@@ -2678,6 +3103,7 @@ async function shutdown() {
     await persistQueue
     await modelLinksWriteQueue
     await stopAllRuntimes()
+    if (llamaServer) llamaServer.shutdownAll()
   } finally {
     clearTimeout(forceExit)
     process.exit(0)
@@ -2719,7 +3145,7 @@ async function main() {
     console.log(`聊天补全：${publicBaseUrl}/v1/chat/completions`)
     console.log(`管理控制台：${publicBaseUrl}/admin`)
     console.log(`监听：${host}:${port}`)
-    console.log(`推理并发 ${maxConcurrency}，队列上限 ${maxQueue}；非热启动模型闲置 ${Math.round(modelIdleTimeoutMs / 1000)} 秒后自动回收；保活间隔 ${Math.round(keepAliveIntervalMs / 1000)} 秒`)
+    console.log(`推理并发 ${maxConcurrency}，排队不限量但最长等待 ${Math.round(queueTimeoutMs / 60000)} 分钟；非热启动模型闲置 ${Math.round(modelIdleTimeoutMs / 1000)} 秒后自动回收；保活间隔 ${Math.round(keepAliveIntervalMs / 1000)} 秒`)
     startHeartbeat()
     warmHotModel().catch((error) => console.error(`热启动预热失败：${error.message}`))
   })

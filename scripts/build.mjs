@@ -7,9 +7,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const outputDir = path.join(root, 'dist')
 const runtimeFiles = [
   'server/index.js',
+  'server/llamaServerManager.js',
   'start.js',
   'workers/inference-worker.js',
-  'config/models.config.json',
+  'config/models.config.jsonl',
   '.env',
   '.npmrc',
   'package.json',

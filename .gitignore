@@ -5,9 +5,7 @@ datasets/
 coverage/
 .cache/
 web/
-
-# 容器本地状态，禁止入库，git pull 不会覆盖
-config/models.config.json
+bin/
 
 usage.json
 results*.json

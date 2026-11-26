@@ -42,9 +42,15 @@ async function disposeResources() {
   llama = undefined
 }
 
-function createChatWrapper() {
-  if (/qwen3[.-]?5/i.test(path.basename(model.filename))) {
-    return new QwenChatWrapper({ variation: '3.5', thoughts: 'discourage' })
+function createChatWrapper(enableThinking) {
+  const name = path.basename(model.filename)
+  if (/qwen3[.-]?5/i.test(name)) {
+    // Qwen3.5 混合思考：默认不思考，enable_thinking=true 时强制开启
+    return new QwenChatWrapper({ variation: '3.5', thoughts: enableThinking === true ? 'auto' : 'discourage' })
+  }
+  if (/qwen3/i.test(name)) {
+    // Qwen3：模板默认思考，enable_thinking=false 时关闭
+    return new QwenChatWrapper({ variation: '3', thoughts: enableThinking === false ? 'discourage' : 'auto' })
   }
   return resolveChatWrapper(model, { warningLogs: false }) ?? new GeneralChatWrapper()
 }
@@ -117,13 +123,14 @@ async function generate(message) {
     const sequence = context.getSequence()
     session = new LlamaChatSession({
       contextSequence: sequence,
-      chatWrapper: createChatWrapper(),
+      chatWrapper: createChatWrapper(options.enableThinking),
       systemPrompt: options.systemPrompt,
       autoDisposeSequence: true,
       contextShift: { strategy: 'eraseFirstResponseAndKeepFirstSystem' },
     })
     session.setChatHistory(options.history)
     const before = session.sequence.tokenMeter.getState()
+    let thoughtText = ''
     const result = await session.promptWithMeta(options.prompt, {
       maxTokens: options.maxTokens,
       temperature: options.temperature,
@@ -132,21 +139,27 @@ async function generate(message) {
       customStopTriggers: options.stop.length > 0 ? options.stop : undefined,
       trimWhitespaceSuffix: true,
       signal: controller.signal,
-      onResponseChunk: options.stream ? (chunk) => {
-        if (chunk.type === undefined && chunk.text) {
-          streamedChunks += 1
-          send({ type: 'chunk', requestId: message.requestId, text: chunk.text })
+      onResponseChunk: (chunk) => {
+        if (chunk.type === 'thought' && chunk.text) {
+          thoughtText += chunk.text
+          if (options.stream) send({ type: 'chunk', requestId: message.requestId, text: chunk.text, kind: 'thought' })
+          return
         }
-      } : undefined,
+        if (chunk.type === undefined && chunk.text && options.stream) {
+          streamedChunks += 1
+          send({ type: 'chunk', requestId: message.requestId, text: chunk.text, kind: 'text' })
+        }
+      },
     })
     const usage = session.sequence.tokenMeter.diff(before)
     if (options.stream && streamedChunks === 0 && result.responseText) {
-      send({ type: 'chunk', requestId: message.requestId, text: result.responseText })
+      send({ type: 'chunk', requestId: message.requestId, text: result.responseText, kind: 'text' })
     }
     send({
       type: 'result',
       requestId: message.requestId,
       text: result.responseText,
+      thoughts: thoughtText || undefined,
       finishReason: result.stopReason === 'maxTokens' ? 'length' : 'stop',
       promptTokens: usage.usedInputTokens,
       completionTokens: usage.usedOutputTokens,
