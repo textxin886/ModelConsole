@@ -6,7 +6,7 @@ coverage/
 .cache/
 web/
 bin/
-
+package-lock.json
 usage.json
 results*.json
 labeled_benchmark_results*.json
